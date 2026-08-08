@@ -4,12 +4,13 @@
 Serial Discrete Event Simulation engine for Hermes.jl (Tier 1 — single-threaded).
 
 Provides:
-- `FutureEventList` — typed wrapper around DataStructures.PriorityQueue
+- `FutureEventList` — typed wrapper around DataStructures.PriorityQueue with FEL-local cancel set
 - `ZoneConfig`      — static zone parameters (servers, capacity, service dist, routing)
-- `sim_loop!`       — main event loop with SimClock throttle
+- `sim_loop!`       — main event loop with SimClock throttle and optional auto-warmup
 - `dispatch!`       — multiple-dispatch event handler (extensible)
 - DES primitive elements: M/M/1, M/M/c, M/M/1/K, M/G/1, M/D/1
 - Phase 2C: routing, priority queuing, NHPP, machine failures, fork-join
+- Sprint 2D: ArrivalProcess hierarchy, FailureModel hierarchy, FEL-local cancellation
 - Machine failure / repair event handlers
 - Welch-method warmup detection
 
@@ -19,6 +20,8 @@ Depends on: SimCore
 module SimDES
 
 using SimCore
+import SimCore: cancel!   # explicit import so fel.jl extends SimCore.cancel!
+                          # (not a new SimDES-local binding, which would cause ambiguity)
 using DataStructures: PriorityQueue, enqueue!, dequeue_pair!, peek, isempty
 using Distributions: Exponential, Erlang, Dirac, UnivariateDistribution, mean
 using Random: AbstractRNG, MersenneTwister, default_rng
@@ -34,6 +37,8 @@ include("runners.jl")
 # ── Exports ───────────────────────────────────────────────────────────────────
 
 # FEL
+# cancel!(fel, id::UInt64) — FEL-local, no lock; extended onto SimCore.cancel! via
+# 'import SimCore: cancel!' above. Same function object → no dual-export ambiguity.
 export FutureEventList, schedule!, safe_dequeue!, peek_time, cancel!
 
 # Zone configuration
@@ -52,6 +57,12 @@ export ForkJoinConfig
 
 # Queue discipline (type-safe enum; Symbol :fifo/:priority also accepted for backward compat)
 export QueueDiscipline, FIFO, PRIORITY_HOL
+
+# Sprint 2D: ArrivalProcess hierarchy (replaces flat arrival_rate/arrival_schedule fields)
+export ArrivalProcess, NoArrival, PoissonArrival, NHPPArrival
+
+# Sprint 2D: FailureModel hierarchy (replaces flat failure_rate/repair_rate fields)
+export FailureModel, NoFailure, BernoulliFailure
 
 # Dispatch (generic — users can extend with their own methods)
 export dispatch!

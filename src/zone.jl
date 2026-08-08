@@ -211,7 +211,97 @@ struct ForkJoinConfig
     final_zone :: Int
 end
 
-# ── Queue discipline enum ─────────────────────────────────────────────────
+# ── Arrival process abstraction ───────────────────────────────────────────────
+
+"""
+    ArrivalProcess
+
+Abstract type for entity arrival processes at a zone.
+
+| Subtype | Meaning |
+|---------|--------|
+| `NoArrival` | No external arrivals — pure sink or downstream-only node |
+| `PoissonArrival(rate)` | Homogeneous Poisson process with constant rate λ |
+| `NHPPArrival(schedule)` | Non-Homogeneous Poisson Process (thinning algorithm) |
+
+# Backward compatibility
+The `ZoneConfig` keyword constructor still accepts `arrival_rate::Float64` and
+`arrival_schedule` kwargs and converts them automatically:
+- `arrival_schedule=sched` → `NHPPArrival(sched)` (takes priority)
+- `arrival_rate=λ > 0` → `PoissonArrival(λ)`
+- neither → `NoArrival()`
+"""
+abstract type ArrivalProcess end
+
+""" No external arrivals — zone is fed only by routed entities from upstream. """
+struct NoArrival <: ArrivalProcess end
+
+"""
+    PoissonArrival(rate)
+
+Homogeneous Poisson arrival process with constant rate λ [entities/time unit].
+"""
+struct PoissonArrival <: ArrivalProcess
+    rate :: Float64
+end
+
+"""
+    NHPPArrival(schedule)
+
+Non-Homogeneous Poisson Process arrivals driven by an `ArrivalRateSchedule`.
+Implemented via the thinning algorithm (Lewis & Shedler 1979).
+"""
+struct NHPPArrival <: ArrivalProcess
+    schedule :: ArrivalRateSchedule
+end
+
+"""Construct an `ArrivalProcess` from legacy `arrival_rate`/`arrival_schedule` kwargs."""
+function _arrival_from_kwargs(arrival_rate::Float64, arrival_schedule)
+    arrival_schedule !== nothing && return NHPPArrival(arrival_schedule)   # NHPP takes priority
+    arrival_rate > 0.0           && return PoissonArrival(arrival_rate)
+    return NoArrival()
+end
+
+# ── Failure model abstraction ──────────────────────────────────────────────────
+
+"""
+    FailureModel
+
+Abstract type for machine failure and repair models.
+
+| Subtype | Meaning |
+|---------|--------|
+| `NoFailure` | Machine never fails (default) |
+| `BernoulliFailure(α, β)` | Exponential TTF (rate α) + exponential repair (rate β); A = β/(α+β) |
+
+# Backward compatibility
+The `ZoneConfig` keyword constructor accepts `failure_rate` and `repair_rate` kwargs:
+- `failure_rate=α > 0, repair_rate=β` → `BernoulliFailure(α, β)`
+- `failure_rate=0.0` (default) → `NoFailure()`
+"""
+abstract type FailureModel end
+
+""" Machine never fails. Default for all zones. """
+struct NoFailure <: FailureModel end
+
+"""
+    BernoulliFailure(α, β)
+
+Machine failure model:
+- Time-to-failure ~ Exponential(1/α); mean time between failures = 1/α
+- Repair time ~ Exponential(1/β); mean repair time = 1/β
+- Steady-state availability A = β/(α+β)
+"""
+struct BernoulliFailure <: FailureModel
+    α :: Float64   # failure rate  [failures per time unit]
+    β :: Float64   # repair rate   [repairs per time unit]
+end
+
+"""Construct a `FailureModel` from legacy `failure_rate`/`repair_rate` kwargs."""
+_failure_from_kwargs(failure_rate::Float64, repair_rate::Float64) =
+    failure_rate > 0.0 ? BernoulliFailure(failure_rate, repair_rate) : NoFailure()
+
+# ── Queue discipline enum ──────────────────────────────────────────────────────
 
 """
     QueueDiscipline
@@ -253,35 +343,40 @@ Pass to `build_world!` before starting a simulation.
 - `num_servers::Int`: number of parallel servers (1 → M/M/1, c → M/M/c)
 - `capacity::Int`: max entities in system (queue + service); `typemax(Int)` = unlimited
 - `service_dist::ServiceDist`: service time distribution
-- `arrival_rate::Float64`: Poisson arrival rate λ [entities per time unit]; `0.0` if external
+- `arrival::ArrivalProcess`: `NoArrival()`, `PoissonArrival(λ)`, or `NHPPArrival(sched)`
 - `lookahead::Float64`: min inter-event transit time to downstream zones (Tier 2 use)
-- `downstream::Vector{Int}`: IDs of zones that receive `TransferOut` events (legacy)
-- `routing::RoutingPolicy`: what happens to entities after service (`ExitSystem`, `FixedRoute`, `ProbRoute`)
-- `queue_discipline::QueueDiscipline`: `FIFO` (default) or `PRIORITY_HOL` (non-preemptive HOL priority)
-- `arrival_schedule`: `nothing` for homogeneous Poisson; `ArrivalRateSchedule` for NHPP
-- `failure_rate::Float64`: α — machine failure rate [failures/time unit]; `0.0` = no failures
-- `repair_rate::Float64`: β — repair rate [repairs/time unit]; only used if `failure_rate > 0`
+- `downstream::Vector{Int}`: IDs of zones that receive `TransferOut` events (Tier 2 only)
+- `routing::RoutingPolicy`: entity routing after service (`ExitSystem`, `FixedRoute`, `ProbRoute`)
+- `queue_discipline::QueueDiscipline`: `FIFO` (default) or `PRIORITY_HOL`
+- `failures::FailureModel`: `NoFailure()` or `BernoulliFailure(α, β)`
 - `fork_join`: `nothing` or `ForkJoinConfig` for fork-join stations
 
 # Examples
 ```julia
-# M/M/1 queue: λ=2/min, μ=3/min, unlimited buffer
+# M/M/1 queue: λ=2/min, μ=3/min, unlimited buffer (legacy arrival_rate kwarg)
 cfg = ZoneConfig(id=1, service_dist=exponential_service(3.0), arrival_rate=2.0)
 
+# Preferred: use typed ArrivalProcess directly
+cfg = ZoneConfig(id=1, service_dist=exponential_service(3.0),
+                 arrival=PoissonArrival(2.0))
+
 # Tandem node 1 → node 2 routing
-cfg1 = ZoneConfig(id=1, service_dist=exponential_service(2.0), arrival_rate=1.0,
-                  routing=FixedRoute(2))
+cfg1 = ZoneConfig(id=1, service_dist=exponential_service(2.0),
+                  arrival=PoissonArrival(1.0), routing=FixedRoute(2))
 cfg2 = ZoneConfig(id=2, service_dist=exponential_service(3.0))
 
-# Non-preemptive priority queue (Symbol or enum both work)
+# Non-preemptive priority queue
 cfg  = ZoneConfig(id=1, service_dist=exponential_service(1.0),
-                  queue_discipline=:priority)           # backward-compat Symbol
-cfg  = ZoneConfig(id=1, service_dist=exponential_service(1.0),
-                  queue_discipline=PRIORITY_HOL)        # preferred enum form
+                  queue_discipline=PRIORITY_HOL)
 
 # Machine with failures (α=0.1, β=1.0, availability≈0.909)
+# Legacy kwargs still work:
 cfg = ZoneConfig(id=1, service_dist=exponential_service(2.0),
                  arrival_rate=1.5, failure_rate=0.1, repair_rate=1.0)
+# Preferred typed form:
+cfg = ZoneConfig(id=1, service_dist=exponential_service(2.0),
+                 arrival=PoissonArrival(1.5),
+                 failures=BernoulliFailure(0.1, 1.0))
 ```
 """
 struct ZoneConfig
@@ -289,14 +384,12 @@ struct ZoneConfig
     num_servers      :: Int
     capacity         :: Int
     service_dist     :: ServiceDist
-    arrival_rate     :: Float64
+    arrival          :: ArrivalProcess        # replaces arrival_rate + arrival_schedule
     lookahead        :: Float64
     downstream       :: Vector{Int}
     routing          :: RoutingPolicy
-    queue_discipline :: QueueDiscipline   # type-safe enum (was Symbol)
-    arrival_schedule :: Union{Nothing, ArrivalRateSchedule}
-    failure_rate     :: Float64
-    repair_rate      :: Float64
+    queue_discipline :: QueueDiscipline
+    failures         :: FailureModel          # replaces failure_rate + repair_rate
     fork_join        :: Union{Nothing, ForkJoinConfig}
 end
 
@@ -305,15 +398,20 @@ function ZoneConfig(;
         num_servers::Int  = 1,
         capacity::Int     = typemax(Int),
         service_dist::ServiceDist,
+        # ── Legacy backward-compat kwargs (auto-converted to typed args) ──
         arrival_rate::Float64  = 0.0,
-        lookahead::Float64     = 0.0,
-        downstream::Vector{Int}    = Int[],
-        routing::RoutingPolicy     = ExitSystem(),
-        queue_discipline           = FIFO,      # accepts QueueDiscipline enum or Symbol
-        arrival_schedule           = nothing,
-        failure_rate::Float64      = 0.0,
-        repair_rate::Float64       = 1.0,
-        fork_join                  = nothing)
+        arrival_schedule       = nothing,
+        failure_rate::Float64  = 0.0,
+        repair_rate::Float64   = 1.0,
+        # ── Preferred typed kwargs ─────────────────────────────────────────
+        arrival::ArrivalProcess = _arrival_from_kwargs(arrival_rate, arrival_schedule),
+        failures::FailureModel  = _failure_from_kwargs(failure_rate, repair_rate),
+        # ── Common kwargs ─────────────────────────────────────────────────
+        lookahead::Float64      = 0.0,
+        downstream::Vector{Int} = Int[],
+        routing::RoutingPolicy  = ExitSystem(),
+        queue_discipline        = FIFO,      # accepts QueueDiscipline enum or Symbol
+        fork_join               = nothing)
 
     num_servers > 0     || throw(ArgumentError("num_servers must be ≥ 1"))
     capacity > 0        || throw(ArgumentError("capacity must be ≥ 1"))
@@ -321,14 +419,12 @@ function ZoneConfig(;
     failure_rate >= 0.0 || throw(ArgumentError("failure_rate must be ≥ 0"))
     repair_rate > 0.0   || throw(ArgumentError("repair_rate must be > 0"))
 
-    # Accept both Symbol (backward compat) and QueueDiscipline enum
     disc = queue_discipline isa Symbol ?
                _discipline_from_symbol(queue_discipline) :
                queue_discipline
 
-    ZoneConfig(id, num_servers, capacity, service_dist, arrival_rate,
-               lookahead, downstream, routing, disc,
-               arrival_schedule, failure_rate, repair_rate, fork_join)
+    ZoneConfig(id, num_servers, capacity, service_dist, arrival,
+               lookahead, downstream, routing, disc, failures, fork_join)
 end
 
 """

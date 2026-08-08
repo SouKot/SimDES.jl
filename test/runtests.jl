@@ -84,7 +84,7 @@ end
             id1 = schedule!(fel, EntityArrival(UInt64(1), 1, 1.0), 1.0)
             id2 = schedule!(fel, EntityArrival(UInt64(2), 1, 2.0), 2.0)
             _   = schedule!(fel, EntityArrival(UInt64(3), 1, 3.0), 3.0)
-            cancel!(id2)
+            cancel!(fel, id2)              # FEL-local cancel — no global lock
             r1 = safe_dequeue!(fel); @test r1[2] == 1.0
             r2 = safe_dequeue!(fel); @test r2[2] == 3.0   # t=2.0 was skipped
             @test safe_dequeue!(fel) === nothing
@@ -104,7 +104,7 @@ end
         ids = [schedule!(fel, NullEvent(), float(i)) for i in 1:1000]
         # Cancel the even-numbered events (500 of them)
         for i in 2:2:1000
-            cancel!(ids[i])
+            cancel!(fel, ids[i])           # FEL-local cancel — no global lock
         end
         executed = 0
         while true
@@ -542,23 +542,43 @@ end  # @testset "SimDES"
     end
 
     # ── ZoneConfig: new fields have correct defaults ──────────────────────────
-    @testset "ZoneConfig: new Phase 2C fields and defaults" begin
+    @testset "ZoneConfig: new Phase 2C/2D fields and defaults" begin
         cfg = ZoneConfig(id=1, service_dist=exponential_service(2.0))
         @test cfg.routing          isa ExitSystem
-        @test cfg.queue_discipline == FIFO        # default is FIFO enum value
-        @test cfg.arrival_schedule === nothing
-        @test cfg.failure_rate     == 0.0
-        @test cfg.repair_rate      == 1.0
+        @test cfg.queue_discipline == FIFO          # default is FIFO enum value
+        @test cfg.arrival          isa NoArrival    # no arrival_rate → NoArrival
+        @test cfg.failures         isa NoFailure    # no failure_rate → NoFailure
         @test cfg.fork_join        === nothing
 
+        # Legacy kwargs still accepted and auto-converted (backward compat)
         cfg2 = ZoneConfig(id=2, service_dist=exponential_service(1.0),
                           routing=FixedRoute(3), queue_discipline=:priority,
                           failure_rate=0.1, repair_rate=0.5)
         @test cfg2.routing          isa FixedRoute
-        @test cfg2.queue_discipline == PRIORITY_HOL   # Symbol :priority → PRIORITY_HOL enum
-        @test cfg2.failure_rate     == 0.1
-        @test cfg2.repair_rate      == 0.5
+        @test cfg2.queue_discipline == PRIORITY_HOL     # Symbol :priority → PRIORITY_HOL enum
+        @test cfg2.failures         isa BernoulliFailure
+        @test cfg2.failures.α       == 0.1              # failure_rate → BernoulliFailure.α
+        @test cfg2.failures.β       == 0.5              # repair_rate  → BernoulliFailure.β
+
+        # Typed ArrivalProcess kwargs (preferred form)
+        cfg3 = ZoneConfig(id=3, service_dist=exponential_service(1.0),
+                          arrival=PoissonArrival(2.5))
+        @test cfg3.arrival isa PoissonArrival
+        @test cfg3.arrival.rate == 2.5
+
+        # Legacy arrival_rate kwarg auto-converts to PoissonArrival
+        cfg4 = ZoneConfig(id=4, service_dist=exponential_service(1.0), arrival_rate=1.0)
+        @test cfg4.arrival isa PoissonArrival
+        @test cfg4.arrival.rate == 1.0
+
+        # Typed FailureModel kwargs (preferred form)
+        cfg5 = ZoneConfig(id=5, service_dist=exponential_service(1.0),
+                          failures=BernoulliFailure(0.2, 2.0))
+        @test cfg5.failures isa BernoulliFailure
+        @test cfg5.failures.α == 0.2
+        @test cfg5.failures.β == 2.0
     end
+
 
     # ── EntityArrival: backward-compatible with priority ──────────────────────
     @testset "EntityArrival: 3-arg backward compat + 4-arg priority" begin

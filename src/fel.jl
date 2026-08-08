@@ -19,20 +19,36 @@ For Tier 2 (per-LP parallel DES), each ZoneState gets its own `FutureEventList`.
     FutureEventList
 
 Thread-local (Tier 1) or per-LP (Tier 2) priority queue of simulation events.
+Carries its own cancellation set — no global lock needed in single-threaded Tier 1.
+For Tier 2, each LP owns its FEL so the set is still unshared (no lock needed).
 
 # Usage
 ```julia
 fel = FutureEventList()
 id  = schedule!(fel, EntityArrival(1, 1, 0.5), 0.5)
 ev, t = safe_dequeue!(fel)   # returns the event + its time
-cancel!(id)                  # future dequeue will skip this event
+cancel!(fel, id)             # lazily cancel — next dequeue will skip it
 ```
 """
 struct FutureEventList
-    queue :: PriorityQueue{CancellableEvent, Float64}
+    queue     :: PriorityQueue{CancellableEvent, Float64}
+    cancelled :: Set{UInt64}   # per-FEL; no lock needed (Tier 1 = single thread,
+                               # Tier 2 = each LP owns its own FEL)
 end
 
-FutureEventList() = FutureEventList(PriorityQueue{CancellableEvent, Float64}())
+FutureEventList() = FutureEventList(PriorityQueue{CancellableEvent, Float64}(),
+                                    Set{UInt64}())
+
+"""
+    cancel!(fel, id) -> nothing
+
+Lazily cancel the event with ID `id`. The next time `safe_dequeue!` encounters
+it in the FEL, the event will be silently skipped.
+
+This is the preferred cancellation API in SimDES (no global lock, O(1) set insert).
+For SimCore-level tests, the global `cancel!(id::UInt64)` in SimCore remains available.
+"""
+cancel!(fel::FutureEventList, id::UInt64) = (push!(fel.cancelled, id); nothing)
 
 """
     schedule!(fel, event, t) -> UInt64
@@ -55,8 +71,8 @@ Returns `(event, time)` or `nothing` if the FEL is empty.
 function safe_dequeue!(fel::FutureEventList)
     while !Base.isempty(fel.queue)
         cev, t = dequeue_pair!(fel.queue)
-        if is_cancelled(cev.id)
-            SimCore._consume_cancelled!(cev.id)
+        if cev.id in fel.cancelled
+            delete!(fel.cancelled, cev.id)   # consume: free memory, O(1) no lock
             continue          # skip cancelled events
         end
         return cev, t

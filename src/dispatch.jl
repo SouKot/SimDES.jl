@@ -222,9 +222,9 @@ end
 
 Handle a resource (machine/server) failure.
 
-Uses `cfg.repair_rate` (β) for exponential repair time distribution.
-Machine availability tracked as fraction of time server is operational.
-Next failure is re-scheduled after repair using `cfg.failure_rate` (α).
+Uses `cfg.failures::BernoulliFailure` for repair time (β) and reschedule (α).
+If `cfg.failures` is `NoFailure`, this handler is a no-op (event should not have
+been scheduled, but is handled defensively).
 """
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
@@ -238,17 +238,19 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     zone.busy_servers = max(0, zone.busy_servers - 1)
     zone.num_servers  = max(0, zone.num_servers - 1)
 
-    # Schedule repair using configured repair_rate β
-    repair_time = rand(rng, Exponential(1.0 / cfg.repair_rate))
-    schedule!(fel, ScheduledChange{:Repair}(e.resource_id, t + repair_time),
-              t + repair_time)
+    # Schedule repair using BernoulliFailure repair rate β
+    if cfg.failures isa BernoulliFailure
+        repair_time = rand(rng, Exponential(1.0 / cfg.failures.β))
+        schedule!(fel, ScheduledChange{:Repair}(e.resource_id, t + repair_time),
+                  t + repair_time)
+    end
 end
 
 """
     dispatch!(world, fel, configs, rng, e::ScheduledChange{:Repair}, t)
 
 Restore one server after a machine repair; serve a waiting entity if any.
-Reschedules the next machine failure using `cfg.failure_rate` (α).
+Reschedules the next machine failure using `cfg.failures::BernoulliFailure` rate α.
 """
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
@@ -276,9 +278,9 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
         end
     end
 
-    # Reschedule next failure if failure_rate > 0
-    if cfg.failure_rate > 0.0
-        ttf = rand(rng, Exponential(1.0 / cfg.failure_rate))
+    # Reschedule next failure using BernoulliFailure failure rate α
+    if cfg.failures isa BernoulliFailure
+        ttf = rand(rng, Exponential(1.0 / cfg.failures.α))
         schedule!(fel, ResourceFailure(e.zone_id, 1.0f0, t + ttf), t + ttf)
     end
 end
@@ -394,24 +396,37 @@ end
 """
     _schedule_next_arrival!(world, fel, configs, rng, zone_id, cfg, t)
 
-Schedule the next entity arrival for a zone. Supports:
-- Homogeneous Poisson process (arrival_rate > 0)
-- NHPP via thinning (arrival_schedule ≠ nothing)
+Schedule the next entity arrival for a zone based on `cfg.arrival::ArrivalProcess`:
+- `NoArrival`: no-op
+- `PoissonArrival(λ)`: homogeneous Poisson with rate λ
+- `NHPPArrival(sched)`: NHPP via thinning (Lewis & Shedler 1979)
 """
 function _schedule_next_arrival!(world::SimWorld, fel::FutureEventList,
                                   configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
                                   zone_id::Int, cfg::ZoneConfig, t::Float64)
-    if cfg.arrival_schedule !== nothing
-        # NHPP thinning: find next accepted arrival
-        t_next = next_nhpp_arrival(cfg.arrival_schedule, t, rng)
-        if isfinite(t_next)
-            schedule!(fel, EntityArrival(new_entity_id!(world), zone_id, t_next), t_next)
-        end
-    elseif cfg.arrival_rate > 0.0
-        # Homogeneous Poisson
-        Δt = rand(rng, Exponential(1.0 / cfg.arrival_rate))
-        schedule!(fel, EntityArrival(new_entity_id!(world), zone_id, t + Δt), t + Δt)
+    _schedule_next_arrival!(world, fel, rng, zone_id, cfg.arrival, t)
+end
+
+# Dispatch on ArrivalProcess subtype — zero-overhead, closed extension point
+_schedule_next_arrival!(::SimWorld, ::FutureEventList, ::AbstractRNG,
+                        ::Int, ::NoArrival, ::Float64) = nothing
+
+function _schedule_next_arrival!(world::SimWorld, fel::FutureEventList,
+                                  rng::AbstractRNG, zone_id::Int,
+                                  a::PoissonArrival, t::Float64)
+    Δt = rand(rng, Exponential(1.0 / a.rate))
+    schedule!(fel, EntityArrival(new_entity_id!(world), zone_id, t + Δt), t + Δt)
+    return nothing
+end
+
+function _schedule_next_arrival!(world::SimWorld, fel::FutureEventList,
+                                  rng::AbstractRNG, zone_id::Int,
+                                  a::NHPPArrival, t::Float64)
+    t_next = next_nhpp_arrival(a.schedule, t, rng)
+    if isfinite(t_next)
+        schedule!(fel, EntityArrival(new_entity_id!(world), zone_id, t_next), t_next)
     end
+    return nothing
 end
 
 """
