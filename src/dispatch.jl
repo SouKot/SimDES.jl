@@ -125,7 +125,7 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
             agent = DESAgent(t, e.zone_id, e.priority, Inf)
             add_des_agent!(world, e.entity_id, agent)
             zone.queue_length += 1
-            if cfg.queue_discipline == :priority && e.priority != 0
+            if cfg.queue_discipline == PRIORITY_HOL && e.priority != 0
                 # Non-preemptive HOL: insert at correct priority position
                 _priority_enqueue!(world, zone, e.entity_id, e.priority, t)
             else
@@ -183,7 +183,7 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
             # that sim_summary(world.stats).W reflects true fork-join sojourn.
             _record_zone_departure!(world, e.station_id, wait_time, zone_sojourn)
             _handle_join!(world, fel, configs, rng, e.entity_id, t)
-            remove_entity!(world, e.entity_id)
+            remove_des_agent!(world, e.entity_id)   # hot path: skip 3 wasted Dict ops
         else
             # Regular entity: record to both global and zone-specific stats
             record_departure!(world.stats, wait_time, zone_sojourn)
@@ -325,22 +325,26 @@ function _update_time_averages!(world::SimWorld, zone::ZoneState, zone_id::Int, 
             record_utilization!(world.stats, frac_busy * dt)
         end
 
-        # Per-zone stats (for multi-zone network validation)
-        zs = get(world.zone_stats, zone_id, nothing)
-        if zs !== nothing
-            zs.warmup_complete = world.stats.warmup_complete
-            record_queue_length!(zs, n_in_system, dt)
-            # Track machine UPTIME (for availability = uptime/elapsed_sim_time)
-            # Also track server busy fraction for utilization metric
-            if zone.num_servers > 0
-                record_uptime!(zs, dt)   # machine is up during this interval
-                if zone.busy_servers > 0
-                    frac_busy = zone.busy_servers / zone.num_servers
-                    record_utilization!(zs, frac_busy * dt)
+        # Per-zone stats (for multi-zone network validation).
+        # Guard: skip the Dict lookup entirely for single-zone simulations where
+        # world.zone_stats is empty (avoids a hash-miss on every event).
+        if !isempty(world.zone_stats)
+            zs = get(world.zone_stats, zone_id, nothing)
+            if zs !== nothing
+                zs.warmup_complete = world.stats.warmup_complete
+                record_queue_length!(zs, n_in_system, dt)
+                # Track machine UPTIME (for availability = uptime/elapsed_sim_time)
+                # Also track server busy fraction for utilization metric
+                if zone.num_servers > 0
+                    record_uptime!(zs, dt)   # machine is up during this interval
+                    if zone.busy_servers > 0
+                        frac_busy = zone.busy_servers / zone.num_servers
+                        record_utilization!(zs, frac_busy * dt)
+                    end
                 end
+                # Note: when num_servers == 0 (machine down), neither uptime nor
+                # busy_time accrues — this is the correct semantics.
             end
-            # Note: when num_servers == 0 (machine down), neither uptime nor
-            # busy_time accrues — this is the correct semantics.
         end
     end
     zone.last_event_time = t
@@ -364,7 +368,7 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
         entry_t = get(world.entry_times, entity_id, agent.arrival_time)
         total_sojourn = t - entry_t
         delete!(world.entry_times, entity_id)
-        remove_entity!(world, entity_id)
+        remove_des_agent!(world, entity_id)   # hot path: skip 3 wasted Dict ops
 
     elseif cfg.routing isa FixedRoute
         dest = cfg.routing.to
@@ -378,7 +382,7 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
         if dest === nothing
             # Exit system
             delete!(world.entry_times, entity_id)
-            remove_entity!(world, entity_id)
+            remove_des_agent!(world, entity_id)   # hot path: skip 3 wasted Dict ops
         else
             world.des_agents[entity_id] = DESAgent(t, dest, agent.priority, Inf)
             # Routed arrival: is_external=false — does NOT trigger next external arrival at dest

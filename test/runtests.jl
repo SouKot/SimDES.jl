@@ -545,7 +545,7 @@ end  # @testset "SimDES"
     @testset "ZoneConfig: new Phase 2C fields and defaults" begin
         cfg = ZoneConfig(id=1, service_dist=exponential_service(2.0))
         @test cfg.routing          isa ExitSystem
-        @test cfg.queue_discipline == :fifo
+        @test cfg.queue_discipline == FIFO        # default is FIFO enum value
         @test cfg.arrival_schedule === nothing
         @test cfg.failure_rate     == 0.0
         @test cfg.repair_rate      == 1.0
@@ -555,7 +555,7 @@ end  # @testset "SimDES"
                           routing=FixedRoute(3), queue_discipline=:priority,
                           failure_rate=0.1, repair_rate=0.5)
         @test cfg2.routing          isa FixedRoute
-        @test cfg2.queue_discipline == :priority
+        @test cfg2.queue_discipline == PRIORITY_HOL   # Symbol :priority → PRIORITY_HOL enum
         @test cfg2.failure_rate     == 0.1
         @test cfg2.repair_rate      == 0.5
     end

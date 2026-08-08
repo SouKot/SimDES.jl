@@ -50,6 +50,9 @@ export ArrivalRateSchedule, rate_at, next_nhpp_arrival
 # Phase 2C: fork-join
 export ForkJoinConfig
 
+# Queue discipline (type-safe enum; Symbol :fifo/:priority also accepted for backward compat)
+export QueueDiscipline, FIFO, PRIORITY_HOL
+
 # Dispatch (generic — users can extend with their own methods)
 export dispatch!
 

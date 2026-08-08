@@ -211,6 +211,35 @@ struct ForkJoinConfig
     final_zone :: Int
 end
 
+# ── Queue discipline enum ─────────────────────────────────────────────────
+
+"""
+    QueueDiscipline
+
+Type-safe enum selecting how entities wait in a zone's queue.
+Zero runtime cost — the integer representation is optimised away by the compiler.
+
+| Value | Meaning |
+|-------|--------|
+| `FIFO` | First-in-first-out (default) |
+| `PRIORITY_HOL` | Non-preemptive Head-Of-Line priority (higher `priority` field served first) |
+
+# Backward compatibility
+The `ZoneConfig` keyword constructor also accepts Symbols `:fifo` and `:priority`
+and converts them transparently, so existing code continues to work.
+"""
+@enum QueueDiscipline begin
+    FIFO         = 1
+    PRIORITY_HOL = 2
+end
+
+"""Convert a Symbol queue discipline name to the `QueueDiscipline` enum."""
+function _discipline_from_symbol(s::Symbol)
+    s === :fifo     && return FIFO
+    s === :priority && return PRIORITY_HOL
+    throw(ArgumentError("queue_discipline :$s unknown; use :fifo or :priority (or QueueDiscipline enum)"))
+end
+
 # ── ZoneConfig ─────────────────────────────────────────────────────────────────
 
 """
@@ -228,7 +257,7 @@ Pass to `build_world!` before starting a simulation.
 - `lookahead::Float64`: min inter-event transit time to downstream zones (Tier 2 use)
 - `downstream::Vector{Int}`: IDs of zones that receive `TransferOut` events (legacy)
 - `routing::RoutingPolicy`: what happens to entities after service (`ExitSystem`, `FixedRoute`, `ProbRoute`)
-- `queue_discipline::Symbol`: `:fifo` (default) or `:priority` (non-preemptive HOL priority)
+- `queue_discipline::QueueDiscipline`: `FIFO` (default) or `PRIORITY_HOL` (non-preemptive HOL priority)
 - `arrival_schedule`: `nothing` for homogeneous Poisson; `ArrivalRateSchedule` for NHPP
 - `failure_rate::Float64`: α — machine failure rate [failures/time unit]; `0.0` = no failures
 - `repair_rate::Float64`: β — repair rate [repairs/time unit]; only used if `failure_rate > 0`
@@ -244,9 +273,11 @@ cfg1 = ZoneConfig(id=1, service_dist=exponential_service(2.0), arrival_rate=1.0,
                   routing=FixedRoute(2))
 cfg2 = ZoneConfig(id=2, service_dist=exponential_service(3.0))
 
-# Non-preemptive priority queue
+# Non-preemptive priority queue (Symbol or enum both work)
 cfg  = ZoneConfig(id=1, service_dist=exponential_service(1.0),
-                  queue_discipline=:priority)
+                  queue_discipline=:priority)           # backward-compat Symbol
+cfg  = ZoneConfig(id=1, service_dist=exponential_service(1.0),
+                  queue_discipline=PRIORITY_HOL)        # preferred enum form
 
 # Machine with failures (α=0.1, β=1.0, availability≈0.909)
 cfg = ZoneConfig(id=1, service_dist=exponential_service(2.0),
@@ -262,7 +293,7 @@ struct ZoneConfig
     lookahead        :: Float64
     downstream       :: Vector{Int}
     routing          :: RoutingPolicy
-    queue_discipline :: Symbol
+    queue_discipline :: QueueDiscipline   # type-safe enum (was Symbol)
     arrival_schedule :: Union{Nothing, ArrivalRateSchedule}
     failure_rate     :: Float64
     repair_rate      :: Float64
@@ -276,24 +307,27 @@ function ZoneConfig(;
         service_dist::ServiceDist,
         arrival_rate::Float64  = 0.0,
         lookahead::Float64     = 0.0,
-        downstream::Vector{Int}     = Int[],
-        routing::RoutingPolicy      = ExitSystem(),
-        queue_discipline::Symbol    = :fifo,
-        arrival_schedule            = nothing,
-        failure_rate::Float64       = 0.0,
-        repair_rate::Float64        = 1.0,
-        fork_join                   = nothing)
+        downstream::Vector{Int}    = Int[],
+        routing::RoutingPolicy     = ExitSystem(),
+        queue_discipline           = FIFO,      # accepts QueueDiscipline enum or Symbol
+        arrival_schedule           = nothing,
+        failure_rate::Float64      = 0.0,
+        repair_rate::Float64       = 1.0,
+        fork_join                  = nothing)
 
-    num_servers > 0  || throw(ArgumentError("num_servers must be ≥ 1"))
-    capacity > 0     || throw(ArgumentError("capacity must be ≥ 1"))
+    num_servers > 0     || throw(ArgumentError("num_servers must be ≥ 1"))
+    capacity > 0        || throw(ArgumentError("capacity must be ≥ 1"))
     arrival_rate >= 0.0 || throw(ArgumentError("arrival_rate must be ≥ 0"))
     failure_rate >= 0.0 || throw(ArgumentError("failure_rate must be ≥ 0"))
     repair_rate > 0.0   || throw(ArgumentError("repair_rate must be > 0"))
-    queue_discipline in (:fifo, :priority) ||
-        throw(ArgumentError("queue_discipline must be :fifo or :priority"))
+
+    # Accept both Symbol (backward compat) and QueueDiscipline enum
+    disc = queue_discipline isa Symbol ?
+               _discipline_from_symbol(queue_discipline) :
+               queue_discipline
 
     ZoneConfig(id, num_servers, capacity, service_dist, arrival_rate,
-               lookahead, downstream, routing, queue_discipline,
+               lookahead, downstream, routing, disc,
                arrival_schedule, failure_rate, repair_rate, fork_join)
 end
 
