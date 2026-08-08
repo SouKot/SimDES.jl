@@ -1,13 +1,25 @@
 name = "SimDES"
 uuid = "4b36ed4b-0aee-48cb-8514-e2c6d0980b55"
-authors = ["Sourabh Kotnala <sauravkotnala@gmail.com>"]
 version = "1.0.0-DEV"
+authors = ["Sourabh Kotnala <sauravkotnala@gmail.com>"]
+
+[deps]
+Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SimCore = "0c356fe6-1c88-4cf8-b16c-a521627c3420"
 
 [compat]
+Aqua = "0.8.16"
+DataStructures = "0.19"
+Distributions = "0.25"
+SimCore = "1"
 julia = "1.10"
 
 [extras]
+Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test"]
+test = ["Aqua", "Test"]
