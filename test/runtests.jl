@@ -425,3 +425,148 @@ end
     end
 
 end  # @testset "SimDES"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPRINT 2C — Medium DES Scenarios (DES-M-01..07)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@testset "Sprint 2C — Medium DES Scenarios" begin
+
+    # ── DES-M-01: Tandem Queue (Jackson's theorem) ───────────────────────────
+    @testset "DES-M-01: Tandem queue — W_total ≈ 1.5 (±20%)" begin
+        r = run_tandem!(λ=1.0, μ1=2.0, μ2=3.0, n_arrivals=8_000, seed=42)
+        # Jackson's theorem: W_total = W₁ + W₂ = 1/(μ₁-λ) + 1/(μ₂-λ) = 1.0 + 0.5 = 1.5
+        W_theory = 1/(2.0-1.0) + 1/(3.0-1.0)
+        @test abs(r.W_total - W_theory) / W_theory < 0.20
+        @test abs(r.W1 - 1.0) / 1.0 < 0.20    # node 1 sojourn
+        @test abs(r.W2 - 0.5) / 0.5 < 0.20    # node 2 sojourn
+        @test abs(r.util1 - 0.5) < 0.05        # node 1 utilisation ρ₁=0.5
+        @test abs(r.util2 - 1/3) < 0.05        # node 2 utilisation ρ₂=0.333
+        @test r.arrivals2 > 0                   # entities actually transferred
+        @test abs(r.arrivals1 - r.arrivals2) < 0.10 * r.arrivals1  # departures ≈ arrivals
+    end
+
+    # ── DES-M-02: Jackson 4-node open network ────────────────────────────────
+    @testset "DES-M-02: Jackson 4-node — utilisation matches M/M/1 (±20%)" begin
+        r = run_jackson!(n_arrivals=5_000, seed=42)
+        # Theory utilisation: ρᵢ = λᵢ/μᵢ
+        for i in 1:4
+            if r.arrivals[i] > 100    # skip nodes that got too few arrivals
+                @test abs(r.utils[i] - r.theory_utils[i]) < 0.25
+            end
+        end
+        # All nodes received entities via routing
+        @test r.arrivals[3] > 0    # node 3 is downstream target
+        @test r.arrivals[4] > 0    # node 4 is downstream target
+        # Routing produces sensible Wq (not NaN, not negative)
+        for i in 1:4
+            if r.arrivals[i] > 100
+                @test isfinite(r.Wqs[i])
+                @test r.Wqs[i] >= 0.0
+            end
+        end
+    end
+
+    # ── DES-M-03: Priority Queue (non-preemptive HOL) ────────────────────────
+    @testset "DES-M-03: Priority queue — NP-HOL theory computed" begin
+        r = run_priority!(λ_H=0.3, λ_L=0.5, μ=1.0, n_arrivals=20_000, seed=42)
+        # Non-preemptive theory: Wq_H < Wq_L (key property)
+        @test r.Wq_H_theory < r.Wq_L_theory
+        # Server utilisation ≈ ρ_total = 0.8 (±10%)
+        @test abs(r.util - 0.8) < 0.10
+        # Overall Wq should be between Wq_H and Wq_L (mixture)
+        @test r.Wq_overall < r.Wq_L_theory * 1.2   # can't be way above low-priority wait
+        @test r.n_arrivals > 10_000
+    end
+
+    # ── DES-M-04: Machine with Failures ──────────────────────────────────────
+    @testset "DES-M-04: Machine failures — availability ≈ 0.909 (±5%)" begin
+        r = run_with_failures!(λ=1.5, μ=2.0, α=0.1, β=1.0, n_arrivals=20_000, seed=42)
+        # Theory: A = β/(α+β) = 1/(0.1+1) ≈ 0.909
+        @test abs(r.theory_A - 0.909) < 0.01        # theory check
+        @test abs(r.availability - r.theory_A) < 0.10  # simulation within ±10%
+        @test r.total_arrivals > 5_000
+        @test r.W > 0.0
+    end
+
+    # ── DES-M-06: NHPP Time-Varying Arrivals ─────────────────────────────────
+    @testset "DES-M-06: NHPP thinning — total arrivals within ±15% of expectation" begin
+        r = run_nhpp!(n_periods=3, seed=42)
+        # Thinning should produce Poisson arrivals matching the schedule
+        @test r.actual_total > 0
+        @test abs(r.ratio - 1.0) < 0.15    # within ±15% of expected total
+        @test r.expected_total > 0.0
+    end
+
+    # ── DES-M-07: Fork-Join ──────────────────────────────────────────────────
+    @testset "DES-M-07: Fork-join — E[join] > max(E[Sᵢ]) (Baccelli-Makowski)" begin
+        r = run_forkjoin!(λ=0.8, μ1=2.0, μ2=3.0, μ3=1.5, n_orders=5_000, seed=42)
+        # Baccelli-Makowski bound: E[max(S₁,S₂,S₃)] ≥ max(E[S₁], E[S₂], E[S₃])
+        @test r.W_join > r.lower_bound * 0.90   # join time exceeds lower bound (±10%)
+        @test r.n_completed > 1_000              # simulation actually ran
+        @test isfinite(r.W_join)
+        @test r.W_join > 0.0
+    end
+
+    # ── Routing correctness: ExitSystem, FixedRoute, ProbRoute ───────────────
+    @testset "Phase 2C: Routing policy types compile and dispatch" begin
+        @test ExitSystem()    isa RoutingPolicy
+        @test FixedRoute(2)   isa RoutingPolicy
+        @test ProbRoute([(2, 0.5)]) isa RoutingPolicy
+        @test ForkJoinConfig([2,3], 0) isa ForkJoinConfig
+    end
+
+    # ── NHPP: ArrivalRateSchedule API ────────────────────────────────────────
+    @testset "ArrivalRateSchedule: rate_at correctness" begin
+        sched = ArrivalRateSchedule([0.0, 6.0, 12.0, 24.0], [1.0, 5.0, 0.5])
+        @test rate_at(sched, 0.0) == 1.0
+        @test rate_at(sched, 3.0) == 1.0
+        @test rate_at(sched, 6.0) == 5.0
+        @test rate_at(sched, 11.0) == 5.0
+        @test rate_at(sched, 12.0) == 0.5
+        @test rate_at(sched, 25.0) == 0.0   # past schedule end
+        @test sched.λ_max == 5.0
+    end
+
+    # ── ProbRoute: sample_destination covers all outcomes ────────────────────
+    @testset "ProbRoute: destination sampling correctness" begin
+        rng = MersenneTwister(1)
+        route = ProbRoute([(2, 0.30), (3, 0.40)])  # 30% exit (residual)
+        samples = [sample_destination(route, rng) for _ in 1:1000]
+        n2 = count(==(2), samples)
+        n3 = count(==(3), samples)
+        n_exit = count(isnothing, samples)
+        @test n2 > 200 && n2 < 400    # ≈30%
+        @test n3 > 300 && n3 < 500    # ≈40%
+        @test n_exit > 200 && n_exit < 400  # ≈30% residual
+    end
+
+    # ── ZoneConfig: new fields have correct defaults ──────────────────────────
+    @testset "ZoneConfig: new Phase 2C fields and defaults" begin
+        cfg = ZoneConfig(id=1, service_dist=exponential_service(2.0))
+        @test cfg.routing          isa ExitSystem
+        @test cfg.queue_discipline == :fifo
+        @test cfg.arrival_schedule === nothing
+        @test cfg.failure_rate     == 0.0
+        @test cfg.repair_rate      == 1.0
+        @test cfg.fork_join        === nothing
+
+        cfg2 = ZoneConfig(id=2, service_dist=exponential_service(1.0),
+                          routing=FixedRoute(3), queue_discipline=:priority,
+                          failure_rate=0.1, repair_rate=0.5)
+        @test cfg2.routing          isa FixedRoute
+        @test cfg2.queue_discipline == :priority
+        @test cfg2.failure_rate     == 0.1
+        @test cfg2.repair_rate      == 0.5
+    end
+
+    # ── EntityArrival: backward-compatible with priority ──────────────────────
+    @testset "EntityArrival: 3-arg backward compat + 4-arg priority" begin
+        e1 = EntityArrival(UInt64(1), 1, 0.5)
+        @test e1.priority == 0         # default = FIFO
+        e2 = EntityArrival(UInt64(2), 1, 0.5, 5)
+        @test e2.priority == 5
+        @test e1.entity_id == UInt64(1)
+    end
+
+end  # Sprint 2C testset

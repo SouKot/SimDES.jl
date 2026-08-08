@@ -5,10 +5,11 @@ Serial Discrete Event Simulation engine for Hermes.jl (Tier 1 — single-threade
 
 Provides:
 - `FutureEventList` — typed wrapper around DataStructures.PriorityQueue
-- `ZoneConfig`      — static zone parameters (servers, capacity, service dist)
+- `ZoneConfig`      — static zone parameters (servers, capacity, service dist, routing)
 - `sim_loop!`       — main event loop with SimClock throttle
 - `dispatch!`       — multiple-dispatch event handler (extensible)
 - DES primitive elements: M/M/1, M/M/c, M/M/1/K, M/G/1, M/D/1
+- Phase 2C: routing, priority queuing, NHPP, machine failures, fork-join
 - Machine failure / repair event handlers
 - Welch-method warmup detection
 
@@ -33,11 +34,21 @@ include("runners.jl")
 # ── Exports ───────────────────────────────────────────────────────────────────
 
 # FEL
-export FutureEventList, schedule!, safe_dequeue!, peek_time
+export FutureEventList, schedule!, safe_dequeue!, peek_time, cancel!
 
 # Zone configuration
 export ZoneConfig, ServiceDist, build_world!
 export exponential_service, deterministic_service, erlang_service
+
+# Phase 2C: routing policies
+export RoutingPolicy, ExitSystem, FixedRoute, ProbRoute
+export sample_destination
+
+# Phase 2C: NHPP
+export ArrivalRateSchedule, rate_at, next_nhpp_arrival
+
+# Phase 2C: fork-join
+export ForkJoinConfig
 
 # Dispatch (generic — users can extend with their own methods)
 export dispatch!
@@ -48,7 +59,14 @@ export WelchDetector, update!, warmup_complete
 # Main loop
 export sim_loop!
 
-# Convenience runners
+# Statistics summary
+export sim_summary
+
+# Convenience runners — Phase 2A+2B
 export run_mm1!, run_mmc!, run_mm1k!, run_mg1!, run_md1!
+
+# Convenience runners — Phase 2C
+export run_tandem!, run_jackson!, run_priority!
+export run_with_failures!, run_nhpp!, run_forkjoin!
 
 end
