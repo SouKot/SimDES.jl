@@ -49,13 +49,14 @@ function run_mm1!(λ::Float64, μ::Float64;
     configs = Dict(1 => cfg)
     build_world!(world, cfg)
     clock = SimClock(Inf)
+    world.stats.warmup_complete = true   # skip warmup for validation runners
 
     # Seed first arrival
     t_first = rand(rng, Exponential(1.0/λ))
     schedule!(fel, EntityArrival(new_entity_id!(world), 1, t_first), t_first)
 
     # Run until n_arrivals OR t_end
-    effective_t_end = isinf(t_end) ? float(n_arrivals) / λ * 5 : t_end
+    effective_t_end = isinf(t_end) ? float(n_arrivals) / max(λ, 1e-6) * 1.1 : t_end
     return sim_loop!(world, fel, configs, clock, rng; t_end=effective_t_end)
 end
 
@@ -89,11 +90,13 @@ function run_mmc!(λ::Float64, μ::Float64, c::Int;
     configs = Dict(1 => cfg)
     build_world!(world, cfg)
     clock = SimClock(Inf)
+    world.stats.warmup_complete = true   # skip warmup for validation runners
 
     t_first = rand(rng, Exponential(1.0/λ))
     schedule!(fel, EntityArrival(new_entity_id!(world), 1, t_first), t_first)
 
-    effective_t_end = isinf(t_end) ? float(n_arrivals) / λ * 5 : t_end
+
+    effective_t_end = isinf(t_end) ? float(n_arrivals) / max(λ, 1e-6) * 1.1 : t_end
     return sim_loop!(world, fel, configs, clock, rng; t_end=effective_t_end)
 end
 
@@ -126,11 +129,12 @@ function run_mm1k!(λ::Float64, μ::Float64, K::Int;
     configs = Dict(1 => cfg)
     build_world!(world, cfg)
     clock = SimClock(Inf)
+    world.stats.warmup_complete = true   # skip warmup for validation runners
 
     t_first = rand(rng, Exponential(1.0/λ))
     schedule!(fel, EntityArrival(new_entity_id!(world), 1, t_first), t_first)
 
-    effective_t_end = isinf(t_end) ? float(n_arrivals) / λ * 5 : t_end
+    effective_t_end = isinf(t_end) ? float(n_arrivals) / max(λ, 1e-6) * 1.1 : t_end
     return sim_loop!(world, fel, configs, clock, rng; t_end=effective_t_end)
 end
 
@@ -149,6 +153,7 @@ Wq = λ·E[S²] / (2(1-ρ))
 # Arguments
 - `k::Int`: Erlang shape parameter (k=1 → M/M/1, k→∞ → M/D/1)
 """
+
 function run_mg1!(λ::Float64, μ::Float64, k::Int;
                   n_arrivals::Int = 200_000,
                   t_end::Float64  = Inf,
@@ -164,11 +169,12 @@ function run_mg1!(λ::Float64, μ::Float64, k::Int;
     configs = Dict(1 => cfg)
     build_world!(world, cfg)
     clock = SimClock(Inf)
+    world.stats.warmup_complete = true   # skip warmup for validation runners
 
     t_first = rand(rng, Exponential(1.0/λ))
     schedule!(fel, EntityArrival(new_entity_id!(world), 1, t_first), t_first)
 
-    effective_t_end = isinf(t_end) ? float(n_arrivals) / λ * 5 : t_end
+    effective_t_end = isinf(t_end) ? float(n_arrivals) / max(λ, 1e-6) * 1.1 : t_end
     return sim_loop!(world, fel, configs, clock, rng; t_end=effective_t_end)
 end
 
@@ -184,6 +190,7 @@ E[S²] = d²   (deterministic → zero variance)
 Wq = λ·d² / (2(1-ρ)) = ρ·d / (2(1-ρ))
 ```
 """
+
 function run_md1!(λ::Float64, d::Float64;
                   n_arrivals::Int = 200_000,
                   t_end::Float64  = Inf,
@@ -199,10 +206,12 @@ function run_md1!(λ::Float64, d::Float64;
     configs = Dict(1 => cfg)
     build_world!(world, cfg)
     clock = SimClock(Inf)
+    world.stats.warmup_complete = true   # skip warmup for validation runners
 
     t_first = rand(rng, Exponential(1.0/λ))
     schedule!(fel, EntityArrival(new_entity_id!(world), 1, t_first), t_first)
 
-    effective_t_end = isinf(t_end) ? float(n_arrivals) / λ * 5 : t_end
+    effective_t_end = isinf(t_end) ? float(n_arrivals) / max(λ, 1e-6) * 1.1 : t_end
     return sim_loop!(world, fel, configs, clock, rng; t_end=effective_t_end)
+
 end

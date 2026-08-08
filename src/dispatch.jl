@@ -5,8 +5,8 @@ Each `dispatch!` method handles one `SimEvent` subtype.
 Julia's multiple dispatch routes each event to the correct handler
 with zero overhead — no if/elseif chains, no vtable lookups.
 
-Users can extend the system by adding new `dispatch!` methods
-in their own code without modifying SimDES source.
+Performance: O(log n) FEL dequeue + O(1) FIFO queue ops per event.
+Correctness: Exact Wq tracked via service_start_time in DESAgent.
 
 Design ref: §7.11 (Event Handler Pattern), §7.12 (Cancel Support)
 DEVS equivalents: δ_ext (EntityArrival) and δ_int (ProcessComplete)
@@ -32,12 +32,9 @@ by Julia's multiple dispatch on the type of `event`.
 
 # Adding custom events
 ```julia
-struct MyCustomEvent <: SimEvent
-    zone_id::Int
-    time::Float64
-end
+struct MyEvent <: SimEvent; zone_id::Int end
 
-function SimDES.dispatch!(world, fel, configs, rng, e::MyCustomEvent, t)
+function SimDES.dispatch!(world, fel, configs, rng, e::MyEvent, t)
     # your logic here
 end
 ```
@@ -45,7 +42,7 @@ end
 function dispatch! end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NullEvent — Chandy-Misra null message, no-op in Tier 1
+# NullEvent — Chandy-Misra null message; no-op in Tier 1
 # ─────────────────────────────────────────────────────────────────────────────
 
 dispatch!(world, fel, configs, rng, ::NullEvent, t) = nothing
@@ -60,12 +57,11 @@ dispatch!(world, fel, configs, rng, ::NullEvent, t) = nothing
 Handle an entity arriving at a zone.
 
 Logic:
-1. Register entity in `world.des_agents`
-2. Check if zone has capacity (M/M/1/K blocking)
-3. If server is free → start service immediately, schedule `ProcessComplete`
-4. If all servers busy → join queue (increment queue_length)
-5. Record statistics: arrival, queue length time-average
-6. Schedule next arrival (if this zone has an arrival_rate > 0)
+1. Update time-average stats for the interval [last_event_time, t]
+2. If system is at capacity (M/M/1/K blocking) → reject entity
+3. If server is free → start service immediately; set service_start_time = t (Wq = 0)
+4. If all servers busy → join FIFO queue; service_start_time left as Inf until served
+5. Schedule next Poisson arrival (if zone has arrival_rate > 0)
 """
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
@@ -73,46 +69,39 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     zone = get_zone(world, e.zone_id)
     cfg  = configs[e.zone_id]
 
-    # ── Record time-average queue length BEFORE this event changes it
-    dt = t - zone.last_event_time
-    if dt > 0.0
-        record_queue_length!(world.stats, zone.queue_length + zone.busy_servers, dt)
-        record_utilization!(world.stats, zone.busy_servers > 0 ? dt : 0.0)
-    end
-    zone.last_event_time = t
+    # ── Time-average stats for interval since last event
+    _update_time_averages!(world.stats, zone, t)
 
-    # ── Record arrival
+    # ── Record arrival (before blocking check)
     record_arrival!(world.stats)
-    world.stats.warmup_complete || (world.stats.warmup_complete = (world.stats.total_arrivals >= _warmup_arrivals(cfg)))
 
     # ── Check finite buffer (M/M/1/K blocking)
     entities_in_system = zone.queue_length + zone.busy_servers
     if entities_in_system >= cfg.capacity
+        # Entity rejected — buffer full
         record_blocked!(world.stats)
-        # Entity is rejected — do NOT add to world
     else
-        # Entity enters the system
-        agent = DESAgent(t, e.zone_id)
-        add_des_agent!(world, e.entity_id, agent)
-
         if zone.busy_servers < cfg.num_servers
-            # A server is free → begin service immediately
+            # ── Server free → begin service immediately (Wq = 0)
             zone.busy_servers += 1
+            agent = DESAgent(t, e.zone_id, 0, t)   # service_start_time = t → Wq = 0
+            add_des_agent!(world, e.entity_id, agent)
             service_time = cfg.service_dist(rng)
             schedule!(fel, ProcessComplete(e.entity_id, e.zone_id, t + service_time),
                       t + service_time)
         else
-            # All servers busy → join queue
+            # ── All servers busy → join FIFO queue (service_start_time = Inf until claimed)
+            agent = DESAgent(t, e.zone_id, 0, Inf)
+            add_des_agent!(world, e.entity_id, agent)
             zone.queue_length += 1
+            push!(zone.queue, e.entity_id)   # O(1) enqueue
         end
     end
 
     # ── Schedule next arrival from this zone's Poisson process (if λ > 0)
     if cfg.arrival_rate > 0.0
-        next_arrival_t = t + rand(rng, Exponential(1.0 / cfg.arrival_rate))
-        next_id        = new_entity_id!(world)
-        schedule!(fel, EntityArrival(next_id, e.zone_id, next_arrival_t),
-                  next_arrival_t)
+        Δt = rand(rng, Exponential(1.0 / cfg.arrival_rate))
+        schedule!(fel, EntityArrival(new_entity_id!(world), e.zone_id, t + Δt), t + Δt)
     end
 end
 
@@ -126,11 +115,11 @@ end
 Handle a service completion at a station.
 
 Logic:
-1. Record time-average stats for the interval since last event
-2. Compute wait time (Wq) and sojourn time (W) for the departing entity
+1. Update time-average stats
+2. Record exact Wq = service_start_time - arrival_time for departing entity
 3. Remove entity from world
-4. If queue is non-empty → dequeue next entity, start service, schedule ProcessComplete
-5. Else → decrement busy_server count (server goes idle)
+4. If queue is non-empty → popfirst! (O(1)), update service_start_time, schedule ProcessComplete
+5. Else → server goes idle (decrement busy_servers)
 """
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
@@ -138,37 +127,36 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     zone = get_zone(world, e.station_id)
     cfg  = configs[e.station_id]
 
-    # ── Record time-average stats for the interval
-    dt = t - zone.last_event_time
-    if dt > 0.0
-        record_queue_length!(world.stats, zone.queue_length + zone.busy_servers, dt)
-        record_utilization!(world.stats, zone.busy_servers > 0 ? dt : 0.0)
-    end
-    zone.last_event_time = t
+    # ── Time-average stats for interval since last event
+    _update_time_averages!(world.stats, zone, t)
 
-    # ── Compute and record sojourn time for departing entity
+    # ── Record departure with exact Wq and W for departing entity
     agent = get_des_agent(world, e.entity_id)
     if agent !== nothing
-        sojourn = t - agent.arrival_time
-        # TODO (Phase 2B): To compute exact Wq, DESAgent needs a `service_start_time`
-        # field set when service begins. Currently Wq=0 in all records; use Little's Law
-        # (Wq = W - 1/μ) in post-processing if exact Wq is needed before 2B.
-        record_departure!(world.stats, 0.0, sojourn)
+        sojourn   = t - agent.arrival_time
+        wait_time = (agent.service_start_time == Inf) ? 0.0 :
+                    agent.service_start_time - agent.arrival_time
+        record_departure!(world.stats, wait_time, sojourn)
         remove_entity!(world, e.entity_id)
     end
 
-    # ── Serve next in queue (if any)
+    # ── Serve next in queue (if any) — O(1) FIFO popfirst!
     if zone.queue_length > 0
         zone.queue_length -= 1
-        # Dequeue oldest entity (FIFO — find the one with earliest arrival_time)
-        next_id, next_agent = _dequeue_oldest(world, e.station_id)
-        if next_id !== nothing
+        next_id = popfirst!(zone.queue)   # O(1) amortized
+        next_agent = get_des_agent(world, next_id)
+        if next_agent !== nothing
+            # Update service_start_time = now (entity waited until this moment)
+            world.des_agents[next_id] = DESAgent(next_agent.arrival_time,
+                                                  next_agent.current_zone,
+                                                  next_agent.priority, t)
             service_time = cfg.service_dist(rng)
             schedule!(fel, ProcessComplete(next_id, e.station_id, t + service_time),
                       t + service_time)
         end
+        # busy_servers stays the same — same server takes next entity
     else
-        zone.busy_servers -= 1
+        zone.busy_servers -= 1   # server goes idle
     end
 end
 
@@ -181,31 +169,23 @@ end
 
 Handle a resource (machine/server) failure.
 
-Logic:
-1. Record time stats
-2. Mark resource as failed in zone state (reduce effective num_servers by 1)
-3. Schedule repair event: `ScheduledChange{:Repair}` at t + repair_time
-4. If severity == 1.0 (complete failure), remove in-service entity (lost)
+Reduces effective server count by 1 and schedules a repair.
 """
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
                    e::ResourceFailure, t::Float64)
     zone = get_zone(world, e.resource_id)
+    cfg  = configs[e.resource_id]
 
-    dt = t - zone.last_event_time
-    if dt > 0.0
-        record_queue_length!(world.stats, zone.queue_length + zone.busy_servers, dt)
-        record_utilization!(world.stats, zone.busy_servers > 0 ? dt : 0.0)
-    end
-    zone.last_event_time = t
+    _update_time_averages!(world.stats, zone, t)
 
-    # Reduce effective server count (floor at 0)
-    zone.busy_servers = max(0, zone.busy_servers - 1)
-    zone.num_servers  = max(1, zone.num_servers - 1)
+    # Reduce effective server count (minimum 0)
+    zone.busy_servers  = max(0, zone.busy_servers - 1)
+    zone.num_servers   = max(1, zone.num_servers - 1)
 
-    # Schedule repair (mean repair time = 1 / (1-availability); use 10× mean service)
-    cfg          = configs[e.resource_id]
-    repair_time  = rand(rng, Exponential(10.0 / max(cfg.arrival_rate, 0.01)))
+    # Schedule repair (mean repair time = 10× mean service time)
+    mean_service = _mean_service_time(cfg)
+    repair_time  = rand(rng, Exponential(10.0 * mean_service))
     schedule!(fel, ScheduledChange{:Repair}(e.resource_id, t + repair_time),
               t + repair_time)
 end
@@ -213,7 +193,7 @@ end
 """
     dispatch!(world, fel, configs, rng, e::ScheduledChange{:Repair}, t)
 
-Handle a machine repair completion — restore one server.
+Restore one server after a machine repair; serve a waiting entity if any.
 """
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
@@ -221,21 +201,20 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     zone = get_zone(world, e.zone_id)
     cfg  = configs[e.zone_id]
 
-    dt = t - zone.last_event_time
-    if dt > 0.0
-        record_queue_length!(world.stats, zone.queue_length + zone.busy_servers, dt)
-        record_utilization!(world.stats, zone.busy_servers > 0 ? dt : 0.0)
-    end
-    zone.last_event_time = t
+    _update_time_averages!(world.stats, zone, t)
 
     zone.num_servers += 1   # restore one server
 
-    # If entities are waiting, start serving them now
+    # If a waiting entity exists and a server slot freed, start serving
     if zone.queue_length > 0 && zone.busy_servers < zone.num_servers
         zone.queue_length -= 1
         zone.busy_servers += 1
-        next_id, _ = _dequeue_oldest(world, e.zone_id)
-        if next_id !== nothing
+        next_id = popfirst!(zone.queue)
+        next_agent = get_des_agent(world, next_id)
+        if next_agent !== nothing
+            world.des_agents[next_id] = DESAgent(next_agent.arrival_time,
+                                                  next_agent.current_zone,
+                                                  next_agent.priority, t)
             service_time = cfg.service_dist(rng)
             schedule!(fel, ProcessComplete(next_id, e.zone_id, t + service_time),
                       t + service_time)
@@ -244,24 +223,22 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TransferOut — entity moves to downstream zone
+# TransferOut — entity moves between zones
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
     dispatch!(world, fel, configs, rng, e::TransferOut, t)
 
-Entity leaves one zone and arrives at a downstream zone after transit time.
-The transit time is the `lookahead` of the *source* zone (minimum delay).
+Entity leaves one zone and arrives at a downstream zone after the transit delay.
 """
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
                    e::TransferOut, t::Float64)
-    dest_cfg     = get(configs, e.dest_zone, nothing)
+    dest_cfg = get(configs, e.dest_zone, nothing)
     dest_cfg === nothing && return   # unknown destination — drop silently
 
-    transit_time = configs[e.dest_zone].lookahead
-    arrival_t    = t + max(transit_time, 0.0)
-    schedule!(fel, EntityArrival(e.entity_id, e.dest_zone, arrival_t), arrival_t)
+    transit = max(dest_cfg.lookahead, 0.0)
+    schedule!(fel, EntityArrival(e.entity_id, e.dest_zone, t + transit), t + transit)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -269,45 +246,32 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
-    _warmup_arrivals(cfg) -> Int
+    _update_time_averages!(stats, zone, t)
 
-Number of arrivals to discard before collecting statistics.
-Rule of thumb: 20× the expected steady-state queue length (min 100).
+Record time-weighted statistics for the period [zone.last_event_time, t].
+Called at the start of every event handler before mutating zone state.
 """
-function _warmup_arrivals(cfg::ZoneConfig)
-    ρ = cfg.arrival_rate / (cfg.num_servers * _mean_service_rate(cfg))
-    ρ = min(ρ, 0.99)   # cap at 0.99 for near-saturated systems
-    expected_L = ρ / (1 - ρ)
-    return max(100, round(Int, 20 * expected_L))
-end
-
-"""
-    _mean_service_rate(cfg) -> Float64
-
-Extract the mean service rate from the zone config's service distribution.
-Used for warmup estimation.
-"""
-function _mean_service_rate(cfg::ZoneConfig)
-    d = cfg.service_dist.dist
-    return 1.0 / mean(d)
-end
-
-"""
-    _dequeue_oldest(world, zone_id) -> (UInt64, DESAgent) or (nothing, nothing)
-
-Find and return the entity in `zone_id` with the earliest `arrival_time`
-(FIFO discipline). Returns `(nothing, nothing)` if no entity found.
-"""
-function _dequeue_oldest(world::SimWorld, zone_id::Int)
-    oldest_id   = nothing
-    oldest_time = Inf
-    oldest_agent = nothing
-    for (id, agent) in world.des_agents
-        if agent.current_zone == zone_id && agent.arrival_time < oldest_time
-            oldest_id    = id
-            oldest_time  = agent.arrival_time
-            oldest_agent = agent
+function _update_time_averages!(stats::SimStats, zone::ZoneState, t::Float64)
+    dt = t - zone.last_event_time
+    if dt > 0.0
+        n_in_system = zone.queue_length + zone.busy_servers
+        record_queue_length!(stats, n_in_system, dt)
+        if zone.busy_servers > 0
+            # Record per-server utilisation: fraction of server capacity in use
+            # For M/M/1:  busy_servers/num_servers = 1/1 = 1 (same as before)
+            # For M/M/c:  e.g. 2 busy / 4 servers = 0.5 → ρ = λ/(c·μ)
+            frac_busy = zone.busy_servers / zone.num_servers
+            record_utilization!(stats, frac_busy * dt)
         end
     end
-    return oldest_id, oldest_agent
+    zone.last_event_time = t
+    return nothing
 end
+
+
+"""
+    _mean_service_time(cfg) -> Float64
+
+Extract mean service time (E[S] = 1/μ) from zone configuration.
+"""
+_mean_service_time(cfg::ZoneConfig) = mean(cfg.service_dist.dist)
