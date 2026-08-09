@@ -12,7 +12,7 @@ SimCore = "0c356fe6-1c88-4cf8-b16c-a521627c3420"
 
 [compat]
 Aqua = "0.8.16"
-DataStructures = "0.19"
+DataStructures = "0.18, 0.19"
 Distributions = "0.25"
 SimCore = "1"
 julia = "1.10"
