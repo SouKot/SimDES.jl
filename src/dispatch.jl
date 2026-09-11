@@ -49,10 +49,40 @@ end
 function dispatch! end
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Task 20 bridge helpers — optional StatsPipeline recording (non-breaking)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@inline _record_arrival_optional!(::Nothing) = nothing
+@inline _record_arrival_optional!(p::StatsPipeline) = (record_arrival!(p); nothing)
+
+@inline _record_departure_optional!(::Nothing, ::Float64, ::Float64) = nothing
+@inline _record_departure_optional!(p::StatsPipeline, wait_time::Float64, sojourn_time::Float64) =
+    (record_departure!(p, wait_time, sojourn_time); nothing)
+
+@inline _record_blocked_optional!(::Nothing) = nothing
+@inline _record_blocked_optional!(p::StatsPipeline) = (record_blocked!(p); nothing)
+
+@inline _record_queue_optional!(::Nothing, ::Int, ::Int, ::Float64) = nothing
+@inline _record_queue_optional!(p::StatsPipeline, n_sys::Int, n_q::Int, dt::Float64) =
+    (record_queue_length!(p, n_sys, n_q, dt); nothing)
+
+@inline _record_util_optional!(::Nothing, ::Float64) = nothing
+@inline _record_util_optional!(p::StatsPipeline, busy_dt::Float64) =
+    (record_utilization!(p, busy_dt); nothing)
+
+@inline _record_idle_optional!(::Nothing, ::Float64) = nothing
+@inline _record_idle_optional!(p::StatsPipeline, idle_dt::Float64) =
+    (record_idle!(p, idle_dt); nothing)
+
+@inline _record_uptime_optional!(::Nothing, ::Float64) = nothing
+@inline _record_uptime_optional!(p::StatsPipeline, dt::Float64) =
+    (record_uptime!(p, dt); nothing)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # NullEvent — Chandy-Misra null message; no-op in Tier 1
 # ─────────────────────────────────────────────────────────────────────────────
 
-dispatch!(world, fel, configs, rng, ::NullEvent, t) = nothing
+dispatch!(world, fel, configs, rng, ::NullEvent, t; pipeline::Union{Nothing,StatsPipeline}=nothing) = nothing
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EntityArrival — entity enters zone (DEVS δ_ext)
@@ -78,12 +108,13 @@ Logic:
 """
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
-                   e::EntityArrival, t::Float64)
+                   e::EntityArrival, t::Float64;
+                   pipeline::Union{Nothing,StatsPipeline}=nothing)
     zone = get_zone(world, e.zone_id)
     cfg  = configs[e.zone_id]
 
     # ── Time-average stats for interval since last event
-    _update_time_averages!(world, zone, e.zone_id, t)
+    _update_time_averages!(world, zone, e.zone_id, t; pipeline=pipeline)
 
     # ── Record system-entry time (first time we see this entity)
     if !haskey(world.entry_times, e.entity_id)
@@ -98,17 +129,19 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
         return
     end
 
-    # ── Record arrival (before blocking check)
-    record_arrival!(world.stats)
-    _record_zone_arrival!(world, e.zone_id)
-
     # ── Check finite buffer (M/M/1/K blocking)
     entities_in_system = zone.queue_length + zone.busy_servers
     if entities_in_system >= cfg.capacity
         # Entity rejected — buffer full
         record_blocked!(world.stats)
+        _record_blocked_optional!(pipeline)
         delete!(world.entry_times, e.entity_id)   # entity never entered system
     else
+        # Accepted arrival (not blocked)
+        record_arrival!(world.stats)
+        _record_arrival_optional!(pipeline)
+        _record_zone_arrival!(world, e.zone_id)
+
         if zone.busy_servers < zone.num_servers
             # ── Server free → begin service immediately (Wq = 0)
             # NOTE: uses zone.num_servers (runtime), not cfg.num_servers (static).
@@ -162,12 +195,13 @@ Logic:
 """
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
-                   e::ProcessComplete, t::Float64)
+                   e::ProcessComplete, t::Float64;
+                   pipeline::Union{Nothing,StatsPipeline}=nothing)
     zone = get_zone(world, e.station_id)
     cfg  = configs[e.station_id]
 
     # ── Time-average stats for interval since last event
-    _update_time_averages!(world, zone, e.station_id, t)
+    _update_time_averages!(world, zone, e.station_id, t; pipeline=pipeline)
 
     # ── Record departure stats and route/remove entity
     agent = get_des_agent(world, e.entity_id)
@@ -182,11 +216,12 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
             # The join completion (in _handle_join!) records to world.stats so
             # that sim_summary(world.stats).W reflects true fork-join sojourn.
             _record_zone_departure!(world, e.station_id, wait_time, zone_sojourn)
-            _handle_join!(world, fel, configs, rng, e.entity_id, t)
+            _handle_join!(world, fel, configs, rng, e.entity_id, t; pipeline=pipeline)
             remove_des_agent!(world, e.entity_id)   # hot path: skip 3 wasted Dict ops
         else
             # Regular entity: record to both global and zone-specific stats
             record_departure!(world.stats, wait_time, zone_sojourn)
+            _record_departure_optional!(pipeline, wait_time, zone_sojourn)
             _record_zone_departure!(world, e.station_id, wait_time, zone_sojourn)
             # ── Route entity according to routing policy
             _route_entity!(world, fel, configs, rng, e.entity_id, agent, cfg, t)
@@ -228,11 +263,12 @@ been scheduled, but is handled defensively).
 """
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
-                   e::ResourceFailure, t::Float64)
+                   e::ResourceFailure, t::Float64;
+                   pipeline::Union{Nothing,StatsPipeline}=nothing)
     zone = get_zone(world, e.resource_id)
     cfg  = configs[e.resource_id]
 
-    _update_time_averages!(world, zone, e.resource_id, t)
+    _update_time_averages!(world, zone, e.resource_id, t; pipeline=pipeline)
 
     # Reduce effective server count (minimum 0)
     zone.busy_servers = max(0, zone.busy_servers - 1)
@@ -254,11 +290,12 @@ Reschedules the next machine failure using `cfg.failures::BernoulliFailure` rate
 """
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
-                   e::ScheduledChange{:Repair}, t::Float64)
+                   e::ScheduledChange{:Repair}, t::Float64;
+                   pipeline::Union{Nothing,StatsPipeline}=nothing)
     zone = get_zone(world, e.zone_id)
     cfg  = configs[e.zone_id]
 
-    _update_time_averages!(world, zone, e.zone_id, t)
+    _update_time_averages!(world, zone, e.zone_id, t; pipeline=pipeline)
 
     zone.num_servers += 1   # restore one server
 
@@ -296,7 +333,8 @@ Entity leaves one zone and arrives at a downstream zone after the transit delay.
 """
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
-                   e::TransferOut, t::Float64)
+                   e::TransferOut, t::Float64;
+                   pipeline::Union{Nothing,StatsPipeline}=nothing)
     dest_cfg = get(configs, e.dest_zone, nothing)
     dest_cfg === nothing && return   # unknown destination — drop silently
 
@@ -315,16 +353,27 @@ Record time-weighted statistics for the period [zone.last_event_time, t].
 Updates both global `world.stats` and per-zone `world.zone_stats[zone_id]`.
 Called at the start of every event handler before mutating zone state.
 """
-function _update_time_averages!(world::SimWorld, zone::ZoneState, zone_id::Int, t::Float64)
+function _update_time_averages!(world::SimWorld, zone::ZoneState, zone_id::Int, t::Float64;
+                                pipeline::Union{Nothing,StatsPipeline}=nothing)
     dt = t - zone.last_event_time
     if dt > 0.0
         n_in_system = zone.queue_length + zone.busy_servers
         record_queue_length!(world.stats, n_in_system, dt)
+        _record_queue_optional!(pipeline, n_in_system, zone.queue_length, dt)
         if zone.busy_servers > 0
             # Per-server utilisation: fraction of server capacity in use
             frac_busy = zone.num_servers > 0 ?
                         zone.busy_servers / zone.num_servers : 0.0
             record_utilization!(world.stats, frac_busy * dt)
+            _record_util_optional!(pipeline, frac_busy * dt)
+            _record_idle_optional!(pipeline, dt - frac_busy * dt)
+        else
+            _record_idle_optional!(pipeline, dt)
+        end
+
+        # Availability: only accrue when at least one server is operational.
+        if zone.num_servers > 0
+            _record_uptime_optional!(pipeline, dt)
         end
 
         # Per-zone stats (for multi-zone network validation).
@@ -508,7 +557,8 @@ When all sub-tasks complete, record total fork-join sojourn time.
 """
 function _handle_join!(world::SimWorld, fel::FutureEventList,
                         configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
-                        sub_entity_id::UInt64, t::Float64)
+                        sub_entity_id::UInt64, t::Float64;
+                        pipeline::Union{Nothing,StatsPipeline}=nothing)
     parent_id = world.sub_entity_map[sub_entity_id]
     delete!(world.sub_entity_map, sub_entity_id)
 
@@ -521,7 +571,9 @@ function _handle_join!(world::SimWorld, fel::FutureEventList,
         # All sub-tasks complete — record total fork-join sojourn
         join_sojourn = t - entry_t
         record_arrival!(world.stats)    # count this as one order arrival
+        _record_arrival_optional!(pipeline)
         record_departure!(world.stats, 0.0, join_sojourn)   # Wq=0 for fork-join
+        _record_departure_optional!(pipeline, 0.0, join_sojourn)
         delete!(world.join_barriers, parent_id)
         delete!(world.entry_times, parent_id)   # clean up entry_times
     else

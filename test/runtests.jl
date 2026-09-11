@@ -40,6 +40,43 @@ function mg1_Wq_erlang(λ, μ, k)
     λ * ES2 / (2 * (1 - ρ))
 end
 
+# ── Task 20/21 diagnostics helper (debugging protocol: diagnose before guessing)
+"""
+    _debug_stats(sm::NamedTuple; λ_expected=NaN, μ_expected=NaN, label="")
+
+Structured diagnostics for integration-test failures.
+Prints Little's Law consistency and key queue metrics without mutating test flow.
+"""
+function _debug_stats(sm::NamedTuple; λ_expected::Float64 = NaN,
+                                      μ_expected::Float64 = NaN,
+                                      label::String = "")
+    L_meas = get(sm, :L, NaN)
+    W_meas = get(sm, :W, NaN)
+    λ_eff  = get(sm, :throughput, NaN)
+    L_pred = λ_eff * W_meas
+    L_err  = (isnan(L_meas) || abs(L_meas) < 1e-12 || isnan(L_pred)) ? NaN : abs(L_pred - L_meas) / abs(L_meas)
+
+    ρ_expected = (isnan(λ_expected) || isnan(μ_expected) || μ_expected <= 0.0) ? NaN : (λ_expected / μ_expected)
+
+    @info "[TASK20_21_DIAG]"
+        label
+        L_meas
+        W_meas
+        Wq_meas = get(sm, :Wq, NaN)
+        Lq_meas = get(sm, :Lq, NaN)
+        utilization = get(sm, :utilization, NaN)
+        throughput = λ_eff
+        warmup_complete = get(sm, :warmup_complete, missing)
+        total_arrivals = get(sm, :total_arrivals, missing)
+        total_departures = get(sm, :total_departures, missing)
+        λ_expected
+        μ_expected
+        ρ_expected
+        L_pred
+        L_err
+    return nothing
+end
+
 @testset "SimDES" begin
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -587,6 +624,122 @@ end  # @testset "SimDES"
         e2 = EntityArrival(UInt64(2), 1, 0.5, 5)
         @test e2.priority == 5
         @test e1.entity_id == UInt64(1)
+    end
+
+    # ── Task 20: optional StatsPipeline bridge in runners ───────────────────
+    @testset "Task 20 — run_mm1! optional pipeline bridge" begin
+        λ = 2.0
+        μ = 4.0
+
+        p = StatsPipeline(warmup=WARMUP_NONE)
+        legacy_stats = run_mm1!(λ, μ; n_arrivals=20_000, seed=42, pipeline=p)
+
+        # Backward-compatible return contract: runner still returns SimStats.
+        @test legacy_stats isa SimStats
+
+        sm = sim_summary(p)
+        if !(sm.total_departures > 0 && sm.warmup_complete)
+            _debug_stats(sm; λ_expected=λ, μ_expected=μ, label="task20_bridge_smoke")
+        end
+        @test sm.total_departures > 0
+        @test sm.warmup_complete == true
+        @test isfinite(sm.W) && sm.W > 0.0
+        @test isfinite(sm.Wq) && sm.Wq >= 0.0
+        @test isfinite(sm.L) && sm.L >= 0.0
+        @test isfinite(sm.utilization)
+
+        ok, _ = check_littles_law(sm; tol=0.20)
+        ok || _debug_stats(sm; λ_expected=λ, μ_expected=μ, label="task20_bridge_little")
+        @test ok
+    end
+
+    # ── Task 21: StatsPipeline integration (SimDES + queueing theory) ──────
+    @testset "Task 21 — StatsPipeline integration" begin
+        λ = 2.0
+        μ = 4.0
+        ρ = λ / μ
+
+        p = StatsPipeline(
+            warmup=WARMUP_FIXED,
+            warmup_n=2_000,
+            sojourn_quantile=0.95,
+            wait_quantile=0.95,
+        )
+
+        # Add P50/P95 custom collectors for explicit quantile monotonicity check.
+        p50 = P2QuantileCollector(0.50)
+        p95 = P2QuantileCollector(0.95)
+        add_collector!(p, :W_p50, p50; trigger=:departure, extract=d -> d.sojourn)
+        add_collector!(p, :W_p95, p95; trigger=:departure, extract=d -> d.sojourn)
+
+        _ = run_mm1!(λ, μ; n_arrivals=60_000, seed=42, pipeline=p)
+        sm = sim_summary(p)
+
+        # Theory references for M/M/1
+        L_th  = mm1_L(ρ)
+        W_th  = mm1_W(μ, ρ)
+        Wq_th = mm1_Wq(μ, ρ)
+
+        # Diagnostic-first: print full stats before asserting when a condition fails.
+        cond_L = isfinite(sm.L) && abs(sm.L - L_th) / L_th < 0.15
+        cond_W = isfinite(sm.W) && abs(sm.W - W_th) / W_th < 0.15
+        cond_Wq = isfinite(sm.Wq) && abs(sm.Wq - Wq_th) / Wq_th < 0.15
+        cond_ρ = isfinite(sm.utilization) && abs(sm.utilization - ρ) < 0.05
+        cond_L || _debug_stats(sm; λ_expected=λ, μ_expected=μ, label="task21_mm1_L")
+        cond_W || _debug_stats(sm; λ_expected=λ, μ_expected=μ, label="task21_mm1_W")
+        cond_Wq || _debug_stats(sm; λ_expected=λ, μ_expected=μ, label="task21_mm1_Wq")
+        cond_ρ || _debug_stats(sm; λ_expected=λ, μ_expected=μ, label="task21_mm1_rho")
+        @test cond_L
+        @test cond_W
+        @test cond_Wq
+        @test cond_ρ
+
+        ok_little, _ = check_littles_law(sm; tol=0.10)
+        ok_little || _debug_stats(sm; λ_expected=λ, μ_expected=μ, label="task21_littles_law")
+        @test ok_little
+
+        # Throughput should be close to λ for stable M/M/1.
+        cond_thr = isfinite(sm.throughput) && abs(sm.throughput - λ) / λ < 0.10
+        cond_thr || _debug_stats(sm; λ_expected=λ, μ_expected=μ, label="task21_throughput")
+        @test cond_thr
+
+        # Quantile sanity: P95 should be >= P50 for sojourn distribution.
+        @test haskey(sm, :W_p50)
+        @test haskey(sm, :W_p95)
+        @test isfinite(sm.W_p50)
+        @test isfinite(sm.W_p95)
+        @test sm.W_p95 >= sm.W_p50
+    end
+
+    @testset "Task 21 — warmup semantics" begin
+        λ = 1.0
+        μ = 2.0
+
+        # WARMUP_NONE: immediate collection from first observations.
+        p_none = StatsPipeline(warmup=WARMUP_NONE)
+        _ = run_mm1!(λ, μ; n_arrivals=5_000, seed=7, pipeline=p_none)
+        sm_none = sim_summary(p_none)
+        @test sm_none.warmup_complete == true
+        @test isfinite(sm_none.W)
+        @test isfinite(sm_none.Wq)
+
+        # WARMUP_FIXED with threshold larger than produced departures: remains closed.
+        p_fixed_closed = StatsPipeline(warmup=WARMUP_FIXED, warmup_n=10_000)
+        _ = run_mm1!(λ, μ; n_arrivals=2_000, seed=7, pipeline=p_fixed_closed)
+        sm_closed = sim_summary(p_fixed_closed)
+        @test sm_closed.warmup_complete == false
+        @test isnan(sm_closed.W)
+        @test isnan(sm_closed.Wq)
+        @test isnan(sm_closed.L)
+
+        # WARMUP_FIXED with reachable threshold: opens and records stats.
+        p_fixed_open = StatsPipeline(warmup=WARMUP_FIXED, warmup_n=500)
+        _ = run_mm1!(λ, μ; n_arrivals=8_000, seed=7, pipeline=p_fixed_open)
+        sm_open = sim_summary(p_fixed_open)
+        @test sm_open.warmup_complete == true
+        @test isfinite(sm_open.W)
+        @test isfinite(sm_open.Wq)
+        @test isfinite(sm_open.L)
     end
 
 end  # Sprint 2C testset
