@@ -78,11 +78,17 @@ function dispatch! end
 @inline _record_uptime_optional!(p::StatsPipeline, dt::Float64) =
     (record_uptime!(p, dt); nothing)
 
+@inline _mark_departure_optional!(::Nothing, ::UInt64) = nothing
+@inline _mark_departure_optional!(sync_bufs::HybridSyncBuffers, entity_id::UInt64) =
+    (mark_departure!(sync_bufs, Int(entity_id)); nothing)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # NullEvent — Chandy-Misra null message; no-op in Tier 1
 # ─────────────────────────────────────────────────────────────────────────────
 
-dispatch!(world, fel, configs, rng, ::NullEvent, t; pipeline::Union{Nothing,StatsPipeline}=nothing) = nothing
+dispatch!(world, fel, configs, rng, ::NullEvent, t;
+          pipeline::Union{Nothing,StatsPipeline}=nothing,
+          sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing) = nothing
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EntityArrival — entity enters zone (DEVS δ_ext)
@@ -109,7 +115,8 @@ Logic:
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
                    e::EntityArrival, t::Float64;
-                   pipeline::Union{Nothing,StatsPipeline}=nothing)
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
     zone = get_zone(world, e.zone_id)
     cfg  = configs[e.zone_id]
 
@@ -196,7 +203,8 @@ Logic:
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
                    e::ProcessComplete, t::Float64;
-                   pipeline::Union{Nothing,StatsPipeline}=nothing)
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
     zone = get_zone(world, e.station_id)
     cfg  = configs[e.station_id]
 
@@ -224,7 +232,8 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
             _record_departure_optional!(pipeline, wait_time, zone_sojourn)
             _record_zone_departure!(world, e.station_id, wait_time, zone_sojourn)
             # ── Route entity according to routing policy
-            _route_entity!(world, fel, configs, rng, e.entity_id, agent, cfg, t)
+            route_outcome = _route_entity!(world, fel, configs, rng, e.entity_id, agent, cfg, t)
+            route_outcome === :exit && _mark_departure_optional!(sync_bufs, e.entity_id)
         end
     end
 
@@ -264,7 +273,8 @@ been scheduled, but is handled defensively).
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
                    e::ResourceFailure, t::Float64;
-                   pipeline::Union{Nothing,StatsPipeline}=nothing)
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
     zone = get_zone(world, e.resource_id)
     cfg  = configs[e.resource_id]
 
@@ -291,7 +301,8 @@ Reschedules the next machine failure using `cfg.failures::BernoulliFailure` rate
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
                    e::ScheduledChange{:Repair}, t::Float64;
-                   pipeline::Union{Nothing,StatsPipeline}=nothing)
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
     zone = get_zone(world, e.zone_id)
     cfg  = configs[e.zone_id]
 
@@ -334,7 +345,8 @@ Entity leaves one zone and arrives at a downstream zone after the transit delay.
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
                    e::TransferOut, t::Float64;
-                   pipeline::Union{Nothing,StatsPipeline}=nothing)
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
     dest_cfg = get(configs, e.dest_zone, nothing)
     dest_cfg === nothing && return   # unknown destination — drop silently
 
@@ -420,6 +432,7 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
         total_sojourn = t - entry_t
         delete!(world.entry_times, entity_id)
         remove_des_agent!(world, entity_id)   # hot path: skip 3 wasted Dict ops
+        return :exit
 
     elseif cfg.routing isa FixedRoute
         dest = cfg.routing.to
@@ -427,6 +440,7 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
         world.des_agents[entity_id] = DESAgent(t, dest, agent.priority, Inf)
         # Routed arrival: is_external=false — does NOT trigger next external arrival at dest
         schedule!(fel, EntityArrival(entity_id, dest, t, agent.priority, false), t)
+        return :routed
 
     elseif cfg.routing isa ProbRoute
         dest = sample_destination(cfg.routing, rng)
@@ -434,12 +448,15 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
             # Exit system
             delete!(world.entry_times, entity_id)
             remove_des_agent!(world, entity_id)   # hot path: skip 3 wasted Dict ops
+            return :exit
         else
             world.des_agents[entity_id] = DESAgent(t, dest, agent.priority, Inf)
             # Routed arrival: is_external=false — does NOT trigger next external arrival at dest
             schedule!(fel, EntityArrival(entity_id, dest, t, agent.priority, false), t)
+            return :routed
         end
     end
+    return :unknown
 end
 
 """

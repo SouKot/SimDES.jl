@@ -432,6 +432,65 @@ end
         @test world.stats.total_arrivals > 0   # zone 2 received arrival
     end
 
+    @testset "Task 24D — ProcessComplete hybrid departure hook" begin
+        @testset "Exit completion queues pending hybrid departure and preserves pipeline stats" begin
+            world   = SimWorld()
+            fel     = FutureEventList()
+            cfg     = ZoneConfig(id=1, service_dist=deterministic_service(1.0), arrival_rate=0.0)
+            configs = Dict(1 => cfg)
+            build_world!(world, cfg)
+            rng     = MersenneTwister(11)
+            clock   = SimClock(Inf)
+            pipe    = StatsPipeline(warmup=WARMUP_NONE)
+            bufs    = HybridSyncBuffers(8)
+
+            entity_id = new_entity_id!(world)
+            schedule!(fel, EntityArrival(entity_id, 1, 0.0), 0.0)
+
+            sim_loop!(world, fel, configs, clock, rng; t_end=5.0, pipeline=pipe, sync_bufs=bufs)
+
+            @test bufs.pending_departures == [Int32(entity_id)]
+            @test get_des_agent(world, entity_id) === nothing
+            @test world.stats.total_arrivals == 1
+            @test world.stats.total_departures == 1
+
+            sm = sim_summary(pipe)
+            @test sm.total_arrivals == 1
+            @test sm.total_departures == 1
+            @test sm.warmup_complete == true
+        end
+
+        @testset "Routed completion does not queue hybrid departure before DES exit" begin
+            world   = SimWorld()
+            fel     = FutureEventList()
+            cfg1    = ZoneConfig(id=1, service_dist=deterministic_service(1.0), arrival_rate=0.0,
+                                 routing=FixedRoute(2))
+            cfg2    = ZoneConfig(id=2, service_dist=deterministic_service(1.0), arrival_rate=0.0)
+            configs = Dict(1 => cfg1, 2 => cfg2)
+            build_world!(world, cfg1, cfg2)
+            rng     = MersenneTwister(17)
+            bufs    = HybridSyncBuffers(8)
+
+            entity_id = new_entity_id!(world)
+            agent = DESAgent(0.0, 1, 0, 0.0)
+            add_des_agent!(world, entity_id, agent)
+            world.entry_times[entity_id] = 0.0
+            zone1 = get_zone(world, 1)
+            zone1.busy_servers = 1
+
+            dispatch!(world, fel, configs, rng, ProcessComplete(entity_id, 1, 1.0), 1.0; sync_bufs=bufs)
+
+            @test isempty(bufs.pending_departures)
+            routed_agent = get_des_agent(world, entity_id)
+            @test routed_agent !== nothing
+            @test routed_agent.current_zone == 2
+            next_ev = safe_dequeue!(fel)
+            @test next_ev !== nothing
+            @test next_ev[1].inner isa EntityArrival
+            @test next_ev[1].inner.zone_id == 2
+        end
+    end
+
     # ── sim_loop! t_end boundary ─────────────────────────────────────────────
     @testset "sim_loop! respects t_end" begin
         world   = SimWorld()

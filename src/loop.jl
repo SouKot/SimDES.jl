@@ -50,7 +50,8 @@ function sim_loop!(world::SimWorld, fel::FutureEventList,
                    clock::SimClock, rng::AbstractRNG;
                    t_end::Float64 = Inf,
                    warmup_n::Int  = 0,
-                   pipeline::Union{Nothing,StatsPipeline}=nothing)
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
     while true
         result = safe_dequeue!(fel)
         result === nothing && break   # FEL exhausted
@@ -61,11 +62,7 @@ function sim_loop!(world::SimWorld, fel::FutureEventList,
         throttle!(clock, t)          # honour speed setting (pause / real-time / fastest)
         world.time = t
 
-        if pipeline === nothing
-            dispatch!(world, fel, configs, rng, cev.inner, t)
-        else
-            dispatch!(world, fel, configs, rng, cev.inner, t; pipeline=pipeline)
-        end
+        dispatch!(world, fel, configs, rng, cev.inner, t; pipeline=pipeline, sync_bufs=sync_bufs)
 
         # Automated warmup: flip flag after warmup_n departures
         # world.stats.total_departures is always incremented by record_departure!,
