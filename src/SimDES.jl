@@ -45,8 +45,9 @@ export FutureEventList, schedule!, safe_dequeue!, peek_time, cancel!
 export ZoneConfig, ServiceDist, build_world!
 export exponential_service, deterministic_service, erlang_service
 
-# Phase 2C: routing policies
+# Phase 2C + 7E: routing policies
 export RoutingPolicy, ExitSystem, FixedRoute, ProbRoute
+export ShortestQueueRoute, RoundRobinRoute, DynamicPolicyRoute
 export sample_destination
 
 # Phase 2C: NHPP

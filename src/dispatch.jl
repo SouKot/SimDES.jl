@@ -124,7 +124,8 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     _update_time_averages!(world, zone, e.zone_id, t; pipeline=pipeline)
 
     # ── Record system-entry time (first time we see this entity)
-    if !haskey(world.entry_times, e.entity_id)
+    is_first_entry = !haskey(world.entry_times, e.entity_id)
+    if is_first_entry
         world.entry_times[e.entity_id] = t
     end
 
@@ -142,12 +143,16 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
         # Entity rejected — buffer full
         record_blocked!(world.stats)
         _record_blocked_optional!(pipeline)
-        delete!(world.entry_times, e.entity_id)   # entity never entered system
+        is_first_entry && delete!(world.entry_times, e.entity_id)   # entity never entered system
     else
         # Accepted arrival (not blocked)
         record_arrival!(world.stats)
         _record_arrival_optional!(pipeline)
         _record_zone_arrival!(world, e.zone_id)
+        if is_first_entry && !isempty(world.zone_stats)
+            sys_zs = get(world.zone_stats, 0, nothing)
+            sys_zs !== nothing && record_arrival!(sys_zs)
+        end
 
         if zone.busy_servers < zone.num_servers
             # ── Server free → begin service immediately (Wq = 0)
@@ -231,6 +236,15 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
             record_departure!(world.stats, wait_time, zone_sojourn)
             _record_departure_optional!(pipeline, wait_time, zone_sojourn)
             _record_zone_departure!(world, e.station_id, wait_time, zone_sojourn)
+            if haskey(world.zone_stats, 0)
+                prio_key = -100 - agent.priority
+                pstats = get!(world.zone_stats, prio_key) do
+                    s = SimStats()
+                    s.warmup_complete = world.zone_stats[0].warmup_complete
+                    s
+                end
+                record_departure!(pstats, wait_time, zone_sojourn)
+            end
             # ── Route entity according to routing policy
             route_outcome = _route_entity!(world, fel, configs, rng, e.entity_id, agent, cfg, t)
             route_outcome === :exit && _mark_departure_optional!(sync_bufs, e.entity_id)
@@ -415,23 +429,37 @@ function _update_time_averages!(world::SimWorld, zone::ZoneState, zone_id::Int, 
 end
 
 """
+    _record_system_exit!(world, entity_id, fallback_entry_t, t)
+
+Record true end-to-end system sojourn W = t_exit - t_entry into `world.zone_stats[0]` if present.
+"""
+@inline function _record_system_exit!(world::SimWorld, entity_id::UInt64, fallback_entry_t::Float64, t::Float64)
+    entry_t = get(world.entry_times, entity_id, fallback_entry_t)
+    total_sojourn = max(0.0, t - entry_t)
+    if haskey(world.zone_stats, 0)
+        record_departure!(world.zone_stats[0], total_sojourn, total_sojourn)
+    end
+    delete!(world.entry_times, entity_id)
+    remove_des_agent!(world, entity_id)   # hot path: skip 3 wasted Dict ops
+end
+
+"""
     _route_entity!(world, fel, configs, rng, entity_id, agent, cfg, t)
 
 Route or remove an entity based on the zone's `RoutingPolicy`.
 - `ExitSystem`: record total sojourn W, remove entity from world
 - `FixedRoute(to)`: schedule `EntityArrival` at the next zone; update current_zone
 - `ProbRoute(choices)`: sample destination, then route or exit
+- `ShortestQueueRoute(candidates)`: pick candidate zone with minimum `(queue_length + busy_servers)`
+- `RoundRobinRoute(candidates)`: cycle across candidate zones
+- `DynamicPolicyRoute(candidates, fn)`: invoke `fn(world, entity_id, agent, candidates)`
 """
 function _route_entity!(world::SimWorld, fel::FutureEventList,
                         configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
                         entity_id::UInt64, agent::DESAgent,
                         cfg::ZoneConfig, t::Float64)
     if cfg.routing isa ExitSystem
-        # Entity exits — record total sojourn from system entry
-        entry_t = get(world.entry_times, entity_id, agent.arrival_time)
-        total_sojourn = t - entry_t
-        delete!(world.entry_times, entity_id)
-        remove_des_agent!(world, entity_id)   # hot path: skip 3 wasted Dict ops
+        _record_system_exit!(world, entity_id, agent.arrival_time, t)
         return :exit
 
     elseif cfg.routing isa FixedRoute
@@ -445,9 +473,7 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
     elseif cfg.routing isa ProbRoute
         dest = sample_destination(cfg.routing, rng)
         if dest === nothing
-            # Exit system
-            delete!(world.entry_times, entity_id)
-            remove_des_agent!(world, entity_id)   # hot path: skip 3 wasted Dict ops
+            _record_system_exit!(world, entity_id, agent.arrival_time, t)
             return :exit
         else
             world.des_agents[entity_id] = DESAgent(t, dest, agent.priority, Inf)
@@ -455,6 +481,57 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
             schedule!(fel, EntityArrival(entity_id, dest, t, agent.priority, false), t)
             return :routed
         end
+
+    elseif cfg.routing isa ShortestQueueRoute
+        cands = cfg.routing.candidates
+        if isempty(cands)
+            _record_system_exit!(world, entity_id, agent.arrival_time, t)
+            return :exit
+        end
+        best_dest = cands[1]
+        best_load = typemax(Int)
+        for cid in cands
+            if haskey(world.zone_states, cid)
+                z = world.zone_states[cid]
+                # Load = waiting in queue + fractional utilization or busy count
+                load = z.queue_length * 1000 + z.busy_servers
+                if load < best_load
+                    best_load = load
+                    best_dest = cid
+                end
+            end
+        end
+        world.des_agents[entity_id] = DESAgent(t, best_dest, agent.priority, Inf)
+        schedule!(fel, EntityArrival(entity_id, best_dest, t, agent.priority, false), t)
+        return :routed
+
+    elseif cfg.routing isa RoundRobinRoute
+        cands = cfg.routing.candidates
+        if isempty(cands)
+            _record_system_exit!(world, entity_id, agent.arrival_time, t)
+            return :exit
+        end
+        idx = mod1(cfg.routing._counter[] + 1, length(cands))
+        cfg.routing._counter[] = idx
+        dest = cands[idx]
+        world.des_agents[entity_id] = DESAgent(t, dest, agent.priority, Inf)
+        schedule!(fel, EntityArrival(entity_id, dest, t, agent.priority, false), t)
+        return :routed
+
+    elseif cfg.routing isa DynamicPolicyRoute
+        cands = cfg.routing.candidates
+        if isempty(cands)
+            _record_system_exit!(world, entity_id, agent.arrival_time, t)
+            return :exit
+        end
+        dest = cfg.routing.policy_fn(world, entity_id, agent, cands)
+        if dest === nothing || dest <= 0
+            _record_system_exit!(world, entity_id, agent.arrival_time, t)
+            return :exit
+        end
+        world.des_agents[entity_id] = DESAgent(t, dest, agent.priority, Inf)
+        schedule!(fel, EntityArrival(entity_id, dest, t, agent.priority, false), t)
+        return :routed
     end
     return :unknown
 end

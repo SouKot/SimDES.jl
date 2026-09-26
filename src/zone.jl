@@ -114,6 +114,39 @@ function sample_destination(route::ProbRoute, rng::AbstractRNG)
     return nothing   # residual probability → exit
 end
 
+"""
+    ShortestQueueRoute(candidates::Vector{Int})
+
+Join-Shortest-Queue (JSQ) routing policy: routes departing entity to the downstream
+candidate zone with the lowest normalized load (`queue_length + busy_servers / num_servers`),
+preferring non-full zones.
+"""
+struct ShortestQueueRoute <: RoutingPolicy
+    candidates :: Vector{Int}
+end
+
+"""
+    RoundRobinRoute(candidates::Vector{Int})
+
+Round-robin routing policy cycling evenly across downstream candidate zones.
+"""
+mutable struct RoundRobinRoute <: RoutingPolicy
+    candidates :: Vector{Int}
+    cursor     :: Int
+    RoundRobinRoute(candidates::Vector{Int}) = new(candidates, 0)
+end
+
+"""
+    DynamicPolicyRoute(candidates::Vector{Int}, policy_fn)
+
+State-dependent routing policy evaluated at departure time:
+`policy_fn(world, entity_id, agent, candidates, rng, t) -> Union{Int, Nothing}`.
+"""
+struct DynamicPolicyRoute{F} <: RoutingPolicy
+    candidates :: Vector{Int}
+    policy_fn  :: F
+end
+
 # ── Non-Homogeneous Poisson Process schedule ───────────────────────────────────
 
 """
