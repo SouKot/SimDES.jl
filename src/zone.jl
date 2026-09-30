@@ -354,13 +354,19 @@ and converts them transparently, so existing code continues to work.
 @enum QueueDiscipline begin
     FIFO         = 1
     PRIORITY_HOL = 2
+    LIFO         = 3
+    EDD          = 4
+    SPT          = 5
 end
 
 """Convert a Symbol queue discipline name to the `QueueDiscipline` enum."""
 function _discipline_from_symbol(s::Symbol)
     s === :fifo     && return FIFO
     s === :priority && return PRIORITY_HOL
-    throw(ArgumentError("queue_discipline :$s unknown; use :fifo or :priority (or QueueDiscipline enum)"))
+    s === :lifo     && return LIFO
+    s === :edd      && return EDD
+    s === :spt      && return SPT
+    throw(ArgumentError("queue_discipline :$s unknown; use :fifo, :priority, :lifo, :edd, or :spt (or QueueDiscipline enum)"))
 end
 
 # ── ZoneConfig ─────────────────────────────────────────────────────────────────
@@ -368,69 +374,45 @@ end
 """
     ZoneConfig
 
-Immutable configuration for a simulation zone (queue + server station).
+Immutable configuration for a simulation zone (queue + server station or conveyor).
 Pass to `build_world!` before starting a simulation.
-
-# Fields
-- `id::Int`: zone identifier (must match a zone registered in `SimWorld`)
-- `num_servers::Int`: number of parallel servers (1 → M/M/1, c → M/M/c)
-- `capacity::Int`: max entities in system (queue + service); `typemax(Int)` = unlimited
-- `service_dist::ServiceDist`: service time distribution
-- `arrival::ArrivalProcess`: `NoArrival()`, `PoissonArrival(λ)`, or `NHPPArrival(sched)`
-- `lookahead::Float64`: min inter-event transit time to downstream zones (Tier 2 use)
-- `downstream::Vector{Int}`: IDs of zones that receive `TransferOut` events (Tier 2 only)
-- `routing::RoutingPolicy`: entity routing after service (`ExitSystem`, `FixedRoute`, `ProbRoute`)
-- `queue_discipline::QueueDiscipline`: `FIFO` (default) or `PRIORITY_HOL`
-- `failures::FailureModel`: `NoFailure()` or `BernoulliFailure(α, β)`
-- `fork_join`: `nothing` or `ForkJoinConfig` for fork-join stations
-
-# Examples
-```julia
-# M/M/1 queue: λ=2/min, μ=3/min, unlimited buffer (legacy arrival_rate kwarg)
-cfg = ZoneConfig(id=1, service_dist=exponential_service(3.0), arrival_rate=2.0)
-
-# Preferred: use typed ArrivalProcess directly
-cfg = ZoneConfig(id=1, service_dist=exponential_service(3.0),
-                 arrival=PoissonArrival(2.0))
-
-# Tandem node 1 → node 2 routing
-cfg1 = ZoneConfig(id=1, service_dist=exponential_service(2.0),
-                  arrival=PoissonArrival(1.0), routing=FixedRoute(2))
-cfg2 = ZoneConfig(id=2, service_dist=exponential_service(3.0))
-
-# Non-preemptive priority queue
-cfg  = ZoneConfig(id=1, service_dist=exponential_service(1.0),
-                  queue_discipline=PRIORITY_HOL)
-
-# Machine with failures (α=0.1, β=1.0, availability≈0.909)
-# Legacy kwargs still work:
-cfg = ZoneConfig(id=1, service_dist=exponential_service(2.0),
-                 arrival_rate=1.5, failure_rate=0.1, repair_rate=1.0)
-# Preferred typed form:
-cfg = ZoneConfig(id=1, service_dist=exponential_service(2.0),
-                 arrival=PoissonArrival(1.5),
-                 failures=BernoulliFailure(0.1, 1.0))
-```
 """
 struct ZoneConfig
-    id               :: Int
-    num_servers      :: Int
-    capacity         :: Int
-    service_dist     :: ServiceDist
-    arrival          :: ArrivalProcess        # replaces arrival_rate + arrival_schedule
-    lookahead        :: Float64
-    downstream       :: Vector{Int}
-    routing          :: RoutingPolicy
-    queue_discipline :: QueueDiscipline
-    failures         :: FailureModel          # replaces failure_rate + repair_rate
-    fork_join        :: Union{Nothing, ForkJoinConfig}
+    id                      :: Int
+    num_servers             :: Int
+    capacity                :: Int
+    service_dist            :: ServiceDist
+    arrival                 :: ArrivalProcess        # replaces arrival_rate + arrival_schedule
+    lookahead               :: Float64
+    downstream              :: Vector{Int}
+    routing                 :: RoutingPolicy
+    queue_discipline        :: QueueDiscipline
+    failures                :: FailureModel          # replaces failure_rate + repair_rate
+    fork_join               :: Union{Nothing, ForkJoinConfig}
+    custom_discipline       :: Union{Nothing, Function}
+    intake_mode             :: Symbol                # :slot_order, :round_robin, :longest_queue, :highest_fill, :custom
+    conveyor_mode           :: Symbol                # :free_flow, :accumulating, :indexing
+    conveyor_pitch          :: Float64
+    conveyor_index_interval :: Float64
+    process_mode            :: Symbol                # :standard, :custom
+    path_length             :: Float64
+    nominal_speed           :: Float64
 end
+
+# Backward-compatible 11-argument positional constructor
+ZoneConfig(id::Int, num_servers::Int, capacity::Int, service_dist::ServiceDist,
+           arrival::ArrivalProcess, lookahead::Float64, downstream::Vector{Int},
+           routing::RoutingPolicy, queue_discipline::QueueDiscipline,
+           failures::FailureModel, fork_join::Union{Nothing, ForkJoinConfig}) =
+    ZoneConfig(id, num_servers, capacity, service_dist, arrival, lookahead, downstream,
+               routing, queue_discipline, failures, fork_join,
+               nothing, :slot_order, :free_flow, 0.5, 1.0, :standard, 5.0, 1.5)
 
 function ZoneConfig(;
         id::Int,
         num_servers::Int  = 1,
         capacity::Int     = typemax(Int),
-        service_dist::ServiceDist,
+        service_dist::ServiceDist = deterministic_service(1.0),
         # ── Legacy backward-compat kwargs (auto-converted to typed args) ──
         arrival_rate::Float64  = 0.0,
         arrival_schedule       = nothing,
@@ -444,7 +426,15 @@ function ZoneConfig(;
         downstream::Vector{Int} = Int[],
         routing::RoutingPolicy  = ExitSystem(),
         queue_discipline        = FIFO,      # accepts QueueDiscipline enum or Symbol
-        fork_join               = nothing)
+        fork_join               = nothing,
+        custom_discipline       = nothing,
+        intake_mode::Symbol     = :slot_order,
+        conveyor_mode::Symbol   = :free_flow,
+        conveyor_pitch::Real    = 0.5,
+        conveyor_index_interval::Real = 1.0,
+        process_mode::Symbol    = :standard,
+        path_length::Real       = 5.0,
+        nominal_speed::Real     = 1.5)
 
     num_servers > 0     || throw(ArgumentError("num_servers must be ≥ 1"))
     capacity > 0        || throw(ArgumentError("capacity must be ≥ 1"))
@@ -457,7 +447,10 @@ function ZoneConfig(;
                queue_discipline
 
     ZoneConfig(id, num_servers, capacity, service_dist, arrival,
-               lookahead, downstream, routing, disc, failures, fork_join)
+               lookahead, downstream, routing, disc, failures, fork_join,
+               custom_discipline, intake_mode, conveyor_mode,
+               Float64(conveyor_pitch), Float64(conveyor_index_interval),
+               process_mode, Float64(path_length), Float64(nominal_speed))
 end
 
 """
@@ -474,6 +467,17 @@ function build_world!(world::SimWorld, configs::ZoneConfig...)
                   num_servers = cfg.num_servers)
         # Register per-zone stats for multi-zone scenarios
         world.zone_stats[cfg.id] = SimStats()
+        if cfg.conveyor_mode != :free_flow || cfg.intake_mode != :slot_order ||
+           cfg.process_mode != :standard || cfg.path_length != 5.0 || cfg.nominal_speed != 1.5
+            SimCore.set_zone_attribute!(world, cfg.id, "_conveyor_mode", cfg.conveyor_mode)
+            SimCore.set_zone_attribute!(world, cfg.id, "_conveyor_pitch", cfg.conveyor_pitch)
+            SimCore.set_zone_attribute!(world, cfg.id, "_conveyor_index_interval", cfg.conveyor_index_interval)
+            SimCore.set_zone_attribute!(world, cfg.id, "_process_mode", cfg.process_mode)
+            SimCore.set_zone_attribute!(world, cfg.id, "_path_length", cfg.path_length)
+            SimCore.set_zone_attribute!(world, cfg.id, "_nominal_speed", cfg.nominal_speed)
+            SimCore.set_zone_attribute!(world, cfg.id, "_intake_mode", cfg.intake_mode)
+        end
     end
     return world
 end
+

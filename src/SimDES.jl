@@ -57,7 +57,7 @@ export ArrivalRateSchedule, rate_at, next_nhpp_arrival
 export ForkJoinConfig
 
 # Queue discipline (type-safe enum; Symbol :fifo/:priority also accepted for backward compat)
-export QueueDiscipline, FIFO, PRIORITY_HOL
+export QueueDiscipline, FIFO, PRIORITY_HOL, LIFO, EDD, SPT
 
 # Sprint 2D: ArrivalProcess hierarchy (replaces flat arrival_rate/arrival_schedule fields)
 export ArrivalProcess, NoArrival, PoissonArrival, NHPPArrival
@@ -66,7 +66,7 @@ export ArrivalProcess, NoArrival, PoissonArrival, NHPPArrival
 export FailureModel, NoFailure, BernoulliFailure
 
 # Dispatch (generic — users can extend with their own methods)
-export dispatch!
+export dispatch!, apply_hook_commands!
 
 # Warmup detector
 export WelchDetector, update!, warmup_complete

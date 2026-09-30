@@ -154,35 +154,66 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
             sys_zs !== nothing && record_arrival!(sys_zs)
         end
 
-        if zone.busy_servers < zone.num_servers
+        pmode = !isempty(world.zone_attributes) ?
+                SimCore.get_zone_attribute(world, e.zone_id, "_process_mode", cfg.process_mode) :
+                cfg.process_mode
+
+        if pmode === :custom
+            # Custom DEVS process mode: place entity in queue/station without auto-scheduling ProcessComplete
+            agent = DESAgent(t, e.zone_id, e.priority, Inf)
+            add_des_agent!(world, e.entity_id, agent)
+            zone.queue_length += 1
+            _enqueue_entity!(world, zone, cfg, e.entity_id, e.priority, t)
+            if cfg.routing isa FixedRoute && !isempty(world.port_directory.wires)
+                dzid = cfg.routing.to
+                if haskey(world.zone_states, dzid) && haskey(configs, dzid)
+                    _try_pull_from_upstream_queues!(world, fel, configs, rng, dzid, world.zone_states[dzid], configs[dzid], t)
+                end
+            end
+        elseif zone.busy_servers < zone.num_servers
             # ── Server free → begin service immediately (Wq = 0)
-            # NOTE: uses zone.num_servers (runtime), not cfg.num_servers (static).
-            # When machine fails, zone.num_servers is decremented to 0,
-            # so this condition correctly becomes false (entities queue, not serve).
             zone.busy_servers += 1
             agent = DESAgent(t, e.zone_id, e.priority, t)   # service_start_time = t → Wq = 0
             add_des_agent!(world, e.entity_id, agent)
-            service_time = cfg.service_dist(rng)
-            schedule!(fel, ProcessComplete(e.entity_id, e.zone_id, t + service_time),
-                      t + service_time)
+            cmode = !isempty(world.zone_attributes) ?
+                    SimCore.get_zone_attribute(world, e.zone_id, "_conveyor_mode", cfg.conveyor_mode) :
+                    cfg.conveyor_mode
+
+            if cmode === :indexing
+                plen = Float64(SimCore.get_zone_attribute(world, e.zone_id, "_path_length", cfg.path_length))
+                spd  = Float64(SimCore.get_zone_attribute(world, e.zone_id, "_nominal_speed", cfg.nominal_speed))
+                k = SimCore.EntityKinematics(e.zone_id, plen, 0.0, t; exit_event_id=UInt64(0))
+                k.nominal_speed = spd
+                world.entity_kinematics[e.entity_id] = k
+                if !Bool(SimCore.get_zone_attribute(world, e.zone_id, "_index_pulse_active", false))
+                    SimCore.set_zone_attribute!(world, e.zone_id, "_index_pulse_active", true)
+                    iv = max(1e-4, Float64(SimCore.get_zone_attribute(world, e.zone_id, "_conveyor_index_interval", cfg.conveyor_index_interval)))
+                    schedule!(fel, SimCore.CustomUserEvent(e.zone_id, "", :_index_pulse, t + iv; interval=iv), t + iv)
+                end
+            else
+                service_time = _compute_service_duration!(world, rng, e.zone_id, e.entity_id, cfg)
+                cev_id = schedule!(fel, ProcessComplete(e.entity_id, e.zone_id, t + service_time),
+                                   t + service_time)
+                if cmode === :accumulating || !isempty(world.entity_kinematics) || !isempty(world.zone_attributes)
+                    plen = Float64(SimCore.get_zone_attribute(world, e.zone_id, "_path_length", cfg.path_length))
+                    spd  = Float64(SimCore.get_zone_attribute(world, e.zone_id, "_nominal_speed", cfg.nominal_speed))
+                    world.entity_kinematics[e.entity_id] =
+                        SimCore.EntityKinematics(e.zone_id, plen, spd, t; exit_event_id=cev_id)
+                    if cmode === :accumulating
+                        _recompute_accumulating_conveyor!(world, fel, configs, e.zone_id, cfg, t)
+                    end
+                end
+            end
         else
             # ── All servers busy (or down) → join queue
             agent = DESAgent(t, e.zone_id, e.priority, Inf)
             add_des_agent!(world, e.entity_id, agent)
             zone.queue_length += 1
-            if cfg.queue_discipline == PRIORITY_HOL && e.priority != 0
-                # Non-preemptive HOL: insert at correct priority position
-                _priority_enqueue!(world, zone, e.entity_id, e.priority, t)
-            else
-                push!(zone.queue, e.entity_id)   # O(1) FIFO enqueue
-            end
+            _enqueue_entity!(world, zone, cfg, e.entity_id, e.priority, t)
         end
     end
 
     # ── Schedule next arrival from this zone's Poisson/NHPP process.
-    # CRITICAL: only fire for zone-owned external arrivals (is_external=true).
-    # Routed arrivals (e.is_external==false) must NOT trigger a new external arrival
-    # at the destination zone — that would exponentially inflate downstream traffic.
     e.is_external && _schedule_next_arrival!(world, fel, configs, rng, e.zone_id, cfg, t)
 end
 
@@ -194,16 +225,6 @@ end
     dispatch!(world, fel, configs, rng, e::ProcessComplete, t)
 
 Handle a service completion at a station.
-
-Logic:
-1. Update time-average stats
-2. Record exact Wq = service_start_time - arrival_time for departing entity
-3. Route entity according to cfg.routing:
-   - ExitSystem  → record total sojourn W, remove entity
-   - FixedRoute  → schedule EntityArrival at next zone (entity persists in world)
-   - ProbRoute   → sample destination, then route or exit
-4. Check fork-join: if sub-entity, decrement barrier; fire join if complete
-5. Serve next entity from queue (O(1) FIFO or O(1) priority dequeue)
 """
 function dispatch!(world::SimWorld, fel::FutureEventList,
                    configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
@@ -216,27 +237,44 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     # ── Time-average stats for interval since last event
     _update_time_averages!(world, zone, e.station_id, t; pipeline=pipeline)
 
+    # ── Check accumulating conveyor blocking before departure
+    cmode = !isempty(world.zone_attributes) ?
+            SimCore.get_zone_attribute(world, e.station_id, "_conveyor_mode", cfg.conveyor_mode) :
+            cfg.conveyor_mode
+    if cmode === :accumulating && _is_downstream_blocked(world, configs, e.station_id, cfg)
+        k = get(world.entity_kinematics, e.entity_id, nothing)
+        if k !== nothing
+            k.base_distance = k.path_length
+            k.current_speed = 0.0
+            k.last_update_time = t
+            k.exit_event_id = UInt64(0)
+        end
+        _recompute_accumulating_conveyor!(world, fel, configs, e.station_id, cfg, t)
+        return
+    end
+
     # ── Record departure stats and route/remove entity
     agent = get_des_agent(world, e.entity_id)
     if agent !== nothing
+        # Save last_processed_attrs for sequence-dependent setup time queries
+        if !isempty(world.entity_attributes) && haskey(world.entity_attributes, e.entity_id)
+            world.last_processed_attrs[e.station_id] = copy(world.entity_attributes[e.entity_id])
+        end
+        !isempty(world.entity_kinematics) && delete!(world.entity_kinematics, e.entity_id)
+
         wait_time = (agent.service_start_time == Inf) ? 0.0 :
                     agent.service_start_time - agent.arrival_time
         zone_sojourn = t - agent.arrival_time
 
         # ── Check fork-join: is this entity a sub-task completing?
         if haskey(world.sub_entity_map, e.entity_id)
-            # Sub-task: record to zone stats only, NOT global stats.
-            # The join completion (in _handle_join!) records to world.stats so
-            # that sim_summary(world.stats).W reflects true fork-join sojourn.
             _record_zone_departure!(world, e.station_id, wait_time, zone_sojourn)
             _handle_join!(world, fel, configs, rng, e.entity_id, t; pipeline=pipeline)
-            remove_des_agent!(world, e.entity_id)   # hot path: skip 3 wasted Dict ops
+            remove_des_agent!(world, e.entity_id)
         else
-            # Regular entity: record to both global and zone-specific stats
             record_departure!(world.stats, wait_time, zone_sojourn)
             _record_departure_optional!(pipeline, wait_time, zone_sojourn)
             _record_zone_departure!(world, e.station_id, wait_time, zone_sojourn)
-            # ── Route entity according to routing policy
             route_outcome = _route_entity!(world, fel, configs, rng, e.entity_id, agent, cfg, t, wait_time)
             if haskey(world.zone_stats, 0)
                 prio_key = -100 - agent.priority
@@ -260,20 +298,34 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     # ── Serve next in queue (if any)
     if zone.queue_length > 0
         zone.queue_length -= 1
-        next_id = popfirst!(zone.queue)   # O(1) for both FIFO and priority queues
+        next_id = _dequeue_next_entity!(world, zone, cfg)
         next_agent = get_des_agent(world, next_id)
         if next_agent !== nothing
-            # Update service_start_time = now (entity waited until this moment)
             world.des_agents[next_id] = DESAgent(next_agent.arrival_time,
                                                   next_agent.current_zone,
                                                   next_agent.priority, t)
-            service_time = cfg.service_dist(rng)
-            schedule!(fel, ProcessComplete(next_id, e.station_id, t + service_time),
-                      t + service_time)
+            service_time = _compute_service_duration!(world, rng, e.station_id, next_id, cfg)
+            cev_id = schedule!(fel, ProcessComplete(next_id, e.station_id, t + service_time),
+                               t + service_time)
+            if cmode === :accumulating || !isempty(world.entity_kinematics)
+                plen = Float64(SimCore.get_zone_attribute(world, e.station_id, "_path_length", cfg.path_length))
+                spd  = Float64(SimCore.get_zone_attribute(world, e.station_id, "_nominal_speed", cfg.nominal_speed))
+                world.entity_kinematics[next_id] =
+                    SimCore.EntityKinematics(e.station_id, plen, spd, t; exit_event_id=cev_id)
+            end
         end
-        # busy_servers stays the same — same server takes next entity
     else
-        zone.busy_servers -= 1   # server goes idle
+        zone.busy_servers = max(0, zone.busy_servers - 1)
+        if !isempty(world.port_directory.wires)
+            _try_pull_from_upstream_queues!(world, fel, configs, rng, e.station_id, zone, cfg, t)
+        end
+    end
+
+    if cmode === :accumulating
+        _recompute_accumulating_conveyor!(world, fel, configs, e.station_id, cfg, t)
+    end
+    if !isempty(world.entity_kinematics)
+        _unblock_upstream_accumulating_conveyors!(world, fel, configs, e.station_id, t)
     end
 end
 
@@ -334,7 +386,7 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     if zone.queue_length > 0 && zone.busy_servers < zone.num_servers
         zone.queue_length -= 1
         zone.busy_servers += 1
-        next_id = popfirst!(zone.queue)
+        next_id = _dequeue_next_entity!(world, zone, cfg)
         next_agent = get_des_agent(world, next_id)
         if next_agent !== nothing
             world.des_agents[next_id] = DESAgent(next_agent.arrival_time,
@@ -470,6 +522,20 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
                         configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
                         entity_id::UInt64, agent::DESAgent,
                         cfg::ZoneConfig, t::Float64, wait_time::Float64=0.0)
+    # I-2: Check for hook-level one-shot route_to! override first
+    if !isempty(world.entity_route_overrides) && haskey(world.entity_route_overrides, entity_id)
+        dest_override = pop!(world.entity_route_overrides, entity_id)
+        if dest_override <= 0 || !haskey(configs, dest_override)
+            _record_system_exit!(world, entity_id, agent.arrival_time, t, wait_time)
+            return :exit
+        else
+            _record_routed_wait!(world, wait_time)
+            world.des_agents[entity_id] = DESAgent(t, dest_override, agent.priority, Inf)
+            schedule!(fel, EntityArrival(entity_id, dest_override, t, agent.priority, false), t)
+            return :routed
+        end
+    end
+
     if cfg.routing isa ExitSystem
         _record_system_exit!(world, entity_id, agent.arrival_time, t, wait_time)
         return :exit
@@ -618,6 +684,91 @@ function _priority_enqueue!(world::SimWorld, zone::ZoneState,
     insert!(q, insert_pos, entity_id)
 end
 
+function _eval_custom_comparator(fn::Function, world::SimWorld, id_a::UInt64, id_b::UInt64)::Bool
+    ea = SimCore.get_entity_state(world, id_a)
+    eb = SimCore.get_entity_state(world, id_b)
+    try
+        return Bool(Base.invokelatest(fn, ea, eb))
+    catch
+        return ea.arrival_time < eb.arrival_time
+    end
+end
+
+function _numeric_attr(world::SimWorld, id::UInt64, key::String, fallback::Float64=Inf)::Float64
+    val = SimCore.get_entity_attribute(world, id, key, fallback)
+    return val isa Real ? Float64(val) : fallback
+end
+
+function _sort_queue_by_discipline!(world::SimWorld, zone::ZoneState, cfg::ZoneConfig)
+    length(zone.queue) <= 1 && return nothing
+    if cfg.custom_discipline !== nothing
+        fn = cfg.custom_discipline
+        sort!(zone.queue, lt = (a, b) -> _eval_custom_comparator(fn, world, a, b))
+    elseif cfg.queue_discipline == EDD
+        sort!(zone.queue, lt = (a, b) -> begin
+            da = _numeric_attr(world, a, "due_date", Inf)
+            db = _numeric_attr(world, b, "due_date", Inf)
+            if da != db
+                return da < db
+            end
+            aga = get_des_agent(world, a)
+            agb = get_des_agent(world, b)
+            ta = aga !== nothing ? aga.arrival_time : 0.0
+            tb = agb !== nothing ? agb.arrival_time : 0.0
+            return ta < tb
+        end)
+    elseif cfg.queue_discipline == SPT
+        sort!(zone.queue, lt = (a, b) -> begin
+            sa = _numeric_attr(world, a, "estimated_service", _numeric_attr(world, a, "service_time", Inf))
+            sb = _numeric_attr(world, b, "estimated_service", _numeric_attr(world, b, "service_time", Inf))
+            if sa != sb
+                return sa < sb
+            end
+            aga = get_des_agent(world, a)
+            agb = get_des_agent(world, b)
+            ta = aga !== nothing ? aga.arrival_time : 0.0
+            tb = agb !== nothing ? agb.arrival_time : 0.0
+            return ta < tb
+        end)
+    elseif cfg.queue_discipline == PRIORITY_HOL
+        sort!(zone.queue, lt = (a, b) -> begin
+            aga = get_des_agent(world, a)
+            agb = get_des_agent(world, b)
+            pa = aga !== nothing ? aga.priority : 0
+            pb = agb !== nothing ? agb.priority : 0
+            if pa != pb
+                return pa > pb
+            end
+            ta = aga !== nothing ? aga.arrival_time : 0.0
+            tb = agb !== nothing ? agb.arrival_time : 0.0
+            return ta < tb
+        end)
+    end
+    return nothing
+end
+
+function _enqueue_entity!(world::SimWorld, zone::ZoneState, cfg::ZoneConfig,
+                          entity_id::UInt64, priority::Int, t::Float64)
+    if cfg.custom_discipline !== nothing || cfg.queue_discipline in (EDD, SPT)
+        push!(zone.queue, entity_id)
+        _sort_queue_by_discipline!(world, zone, cfg)
+    elseif cfg.queue_discipline == PRIORITY_HOL && priority != 0
+        _priority_enqueue!(world, zone, entity_id, priority, t)
+    elseif cfg.queue_discipline == LIFO
+        pushfirst!(zone.queue, entity_id)
+    else
+        push!(zone.queue, entity_id)
+    end
+    return nothing
+end
+
+function _dequeue_next_entity!(world::SimWorld, zone::ZoneState, cfg::ZoneConfig)::UInt64
+    if cfg.custom_discipline !== nothing || cfg.queue_discipline in (EDD, SPT)
+        _sort_queue_by_discipline!(world, zone, cfg)
+    end
+    return popfirst!(zone.queue)
+end
+
 """
     _record_zone_arrival!(world, zone_id)
 
@@ -698,3 +849,513 @@ end
 Extract mean service time (E[S] = 1/μ) from zone configuration.
 """
 _mean_service_time(cfg::ZoneConfig) = mean(cfg.service_dist.dist)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SimViz M-1: Service overrides, CustomUserEvent, Conveyor Physics & Hook Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+@inline function _compute_service_duration!(
+    world::SimWorld,
+    rng::AbstractRNG,
+    zone_id::Int,
+    entity_id::UInt64,
+    cfg::ZoneConfig
+)::Float64
+    base_st = if !isempty(world.zone_service_override) && haskey(world.zone_service_override, (zone_id, entity_id))
+        pop!(world.zone_service_override, (zone_id, entity_id))
+    else
+        cfg.service_dist(rng)
+    end
+    extra_setup = if !isempty(world.zone_setup_time) && haskey(world.zone_setup_time, (zone_id, entity_id))
+        pop!(world.zone_setup_time, (zone_id, entity_id))
+    else
+        0.0
+    end
+    return max(0.0001, base_st + extra_setup)
+end
+
+function _is_downstream_blocked(
+    world::SimWorld,
+    configs::Dict{Int, ZoneConfig},
+    station_id::Int,
+    cfg::ZoneConfig
+)::Bool
+    if cfg.routing isa FixedRoute
+        dest_id = cfg.routing.to
+        if haskey(world.zone_states, dest_id)
+            dz = world.zone_states[dest_id]
+            dcfg = get(configs, dest_id, nothing)
+            cap = dcfg !== nothing ? min(dz.capacity, dcfg.capacity) : dz.capacity
+            if dz.num_servers == 0 || (dz.queue_length + dz.busy_servers) >= cap
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function _recompute_accumulating_conveyor!(
+    world::SimWorld,
+    fel::FutureEventList,
+    configs::Dict{Int, ZoneConfig},
+    zone_id::Int,
+    cfg::ZoneConfig,
+    t::Float64
+)
+    pitch = Float64(SimCore.get_zone_attribute(world, zone_id, "_conveyor_pitch", cfg.conveyor_pitch))
+    plen  = Float64(SimCore.get_zone_attribute(world, zone_id, "_path_length", cfg.path_length))
+    spd   = max(0.001, Float64(SimCore.get_zone_attribute(world, zone_id, "_nominal_speed", cfg.nominal_speed)))
+    blocked_out = _is_downstream_blocked(world, configs, zone_id, cfg)
+
+    # Collect all items currently on this conveyor
+    items = Tuple{UInt64, SimCore.EntityKinematics, Float64}[]
+    for (uid, k) in world.entity_kinematics
+        if k.zone_id == zone_id
+            d_now = SimCore.kinematics_distance(k, t)
+            push!(items, (uid, k, d_now))
+        end
+    end
+    isempty(items) && return nothing
+
+    # Sort from front (closest to outlet, highest distance) to back (lowest distance)
+    sort!(items, by = x -> (-x[3], x[1]))
+
+    for (idx, (uid, k, d_now)) in enumerate(items)
+        stop_pos = max(0.0, plen - (idx - 1) * pitch)
+        k.base_distance = min(d_now, stop_pos)
+        k.last_update_time = t
+
+        if idx == 1 && !blocked_out
+            # Leading item and downstream is open -> move to outlet atplen
+            rem_dist = max(0.0, plen - k.base_distance)
+            k.current_speed = spd
+            if k.exit_event_id != 0
+                cancel!(fel, k.exit_event_id)
+            end
+            dt = rem_dist / spd
+            k.exit_event_id = schedule!(fel, ProcessComplete(uid, zone_id, t + dt), t + dt)
+        else
+            # Either downstream is blocked OR we are behind another item
+            # Check if leader is stopped or moving
+            leader_stopped = (idx == 1 && blocked_out) || (idx > 1 && items[idx - 1][2].current_speed == 0.0)
+            if leader_stopped
+                if k.base_distance >= stop_pos - 1e-4
+                    # Reached accumulation slot -> stop!
+                    k.base_distance = stop_pos
+                    k.current_speed = 0.0
+                    if k.exit_event_id != 0
+                        cancel!(fel, k.exit_event_id)
+                        k.exit_event_id = UInt64(0)
+                    end
+                else
+                    # Still moving toward stop_pos; cancel exit event if it would overshoot
+                    k.current_speed = spd
+                    if k.exit_event_id != 0
+                        cancel!(fel, k.exit_event_id)
+                        k.exit_event_id = UInt64(0)
+                    end
+                    # Schedule an internal arrival at the stop position via CustomUserEvent
+                    dt_stop = (stop_pos - k.base_distance) / spd
+                    schedule!(fel, SimCore.CustomUserEvent(zone_id, "", :_accum_check, t + dt_stop), t + dt_stop)
+                end
+            else
+                # Leader is moving toward outlet
+                rem_dist = max(0.0, plen - k.base_distance)
+                k.current_speed = spd
+                if k.exit_event_id != 0
+                    cancel!(fel, k.exit_event_id)
+                end
+                dt = rem_dist / spd + (idx - 1) * (pitch / spd)
+                k.exit_event_id = schedule!(fel, ProcessComplete(uid, zone_id, t + dt), t + dt)
+            end
+        end
+    end
+    return nothing
+end
+
+function _unblock_upstream_accumulating_conveyors!(
+    world::SimWorld,
+    fel::FutureEventList,
+    configs::Dict{Int, ZoneConfig},
+    freed_zone_id::Int,
+    t::Float64
+)
+    for (uzid, ucfg) in configs
+        cmode = !isempty(world.zone_attributes) ?
+                SimCore.get_zone_attribute(world, uzid, "_conveyor_mode", ucfg.conveyor_mode) :
+                ucfg.conveyor_mode
+        if cmode === :accumulating && ucfg.routing isa FixedRoute && ucfg.routing.to == freed_zone_id
+            if !_is_downstream_blocked(world, configs, uzid, ucfg)
+                _recompute_accumulating_conveyor!(world, fel, configs, uzid, ucfg, t)
+            end
+        end
+    end
+    return nothing
+end
+
+function _try_pull_from_upstream_queues!(
+    world::SimWorld,
+    fel::FutureEventList,
+    configs::Dict{Int, ZoneConfig},
+    rng::AbstractRNG,
+    station_id::Int,
+    zone::ZoneState,
+    cfg::ZoneConfig,
+    t::Float64
+)
+    zone.busy_servers >= zone.num_servers && return nothing
+    pd = world.port_directory
+    h = get(pd.zone_to_handle, station_id, SimCore.INVALID_HANDLE)
+    !isvalid(h) && return nothing
+
+    imode = SimCore.get_zone_attribute(world, station_id, "_intake_mode", cfg.intake_mode)
+    imode === :custom && return nothing   # handled by user's on_pull hook
+
+    ctx = SimCore.HookContext(world, 0, station_id, get(pd.handle_to_name, h, ""), t; rng=rng, fel=fel, configs=configs)
+    pulled = if imode === :round_robin
+        SimCore.SimViz.pull_from_port_round_robin!(ctx, :in_flow)
+    elseif imode === :longest_queue
+        SimCore.SimViz.pull_from_port_longest!(ctx, :in_flow)
+    elseif imode === :highest_fill
+        SimCore.SimViz.pull_from_port_highest_fill!(ctx, :in_flow)
+    else
+        SimCore.SimViz.pull_from_port_slot_order!(ctx, :in_flow)
+    end
+
+    if isvalid(pulled)
+        uid = UInt64(pulled.id)
+        zone.busy_servers += 1
+        ag = get_des_agent(world, uid)
+        arr_t = ag !== nothing ? ag.arrival_time : t
+        prio  = ag !== nothing ? ag.priority : 0
+        world.des_agents[uid] = DESAgent(arr_t, station_id, prio, t)
+        st = _compute_service_duration!(world, rng, station_id, uid, cfg)
+        schedule!(fel, ProcessComplete(uid, station_id, t + st), t + st)
+    end
+    return nothing
+end
+
+"""
+    dispatch!(world, fel, configs, rng, e::CustomUserEvent, t)
+
+Handle a user-scheduled event (`schedule_event!`, `schedule_at!`, `schedule_every!`, `after!`).
+"""
+function dispatch!(world::SimWorld, fel::FutureEventList,
+                   configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
+                   e::SimCore.CustomUserEvent, t::Float64;
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
+    if e.zone_id > 0 && haskey(world.zone_states, e.zone_id)
+        _update_time_averages!(world, world.zone_states[e.zone_id], e.zone_id, t; pipeline=pipeline)
+    end
+
+    if e.tag === :_accum_check && e.zone_id > 0 && haskey(configs, e.zone_id)
+        _recompute_accumulating_conveyor!(world, fel, configs, e.zone_id, configs[e.zone_id], t)
+        return nothing
+    elseif e.tag === :_index_pulse && e.zone_id > 0 && haskey(configs, e.zone_id)
+        cfg = configs[e.zone_id]
+        cmode = !isempty(world.zone_attributes) ?
+                SimCore.get_zone_attribute(world, e.zone_id, "_conveyor_mode", cfg.conveyor_mode) :
+                cfg.conveyor_mode
+        if cmode === :indexing
+            pitch = Float64(SimCore.get_zone_attribute(world, e.zone_id, "_conveyor_pitch", cfg.conveyor_pitch))
+            has_remaining = false
+            for (uid, ag) in world.des_agents
+                if ag.current_zone == e.zone_id && haskey(world.entity_kinematics, uid)
+                    k = world.entity_kinematics[uid]
+                    new_d = clamp(SimCore.kinematics_distance(k, t) + pitch, 0.0, k.path_length)
+                    k.base_distance = new_d
+                    k.last_update_time = t
+                    if new_d >= k.path_length - 1e-9 && k.exit_event_id == 0
+                        k.exit_event_id = schedule!(fel, ProcessComplete(uid, e.zone_id, t), t)
+                    else
+                        has_remaining = true
+                    end
+                end
+            end
+            if has_remaining
+                iv = max(1e-4, Float64(SimCore.get_zone_attribute(world, e.zone_id, "_conveyor_index_interval", cfg.conveyor_index_interval)))
+                schedule!(fel, SimCore.CustomUserEvent(e.zone_id, e.element_id, :_index_pulse, t + iv; interval=iv), t + iv)
+            else
+                SimCore.set_zone_attribute!(world, e.zone_id, "_index_pulse_active", false)
+            end
+        else
+            SimCore.set_zone_attribute!(world, e.zone_id, "_index_pulse_active", false)
+        end
+        return nothing
+    end
+
+    if e.callback !== nothing
+        ctx = SimCore.HookContext(world, 0, e.zone_id, e.element_id, t;
+                                  rng=rng, fel=fel, configs=configs,
+                                  event_tag=e.tag, event_payload=e.payload)
+        SimCore.with_hook_context(ctx) do _
+            Base.invokelatest(e.callback)
+        end
+        apply_hook_commands!(world, fel, configs, rng, ctx)
+    end
+
+    # Reschedule if recurring (schedule_every!)
+    if e.interval > 0.0
+        next_t = t + e.interval
+        next_ev = SimCore.CustomUserEvent(e.zone_id, e.element_id, e.tag, next_t, e.payload, e.interval, e.callback)
+        cev_id = schedule!(fel, next_ev, next_t)
+        if e.zone_id > 0
+            evs = get!(world.active_user_events, e.zone_id, Set{UInt64}())
+            push!(evs, cev_id)
+        end
+    end
+    return nothing
+end
+
+"""
+    apply_hook_commands!(world, fel, configs, rng, ctx::HookContext)
+
+Execute structural simulation commands buffered in `ctx.commands` during a hook invocation.
+"""
+function apply_hook_commands!(
+    world::SimWorld,
+    fel::FutureEventList,
+    configs::Dict{Int, ZoneConfig},
+    rng::AbstractRNG,
+    ctx::SimCore.HookContext
+)
+    t = ctx.t
+    # 1. Priority override on current item
+    if ctx.priority_override !== nothing && ctx.entity_id > 0
+        new_p = ctx.priority_override
+        ag = get_des_agent(world, ctx.entity_id)
+        if ag !== nothing
+            world.des_agents[ctx.entity_id] = DESAgent(ag.arrival_time, ag.current_zone, new_p, ag.service_start_time)
+            if haskey(world.zone_states, ag.current_zone) && haskey(configs, ag.current_zone)
+                _sort_queue_by_discipline!(world, world.zone_states[ag.current_zone], configs[ag.current_zone])
+            end
+        end
+    end
+
+    # 2. Route override on current item
+    if ctx.route_override !== nothing && ctx.entity_id > 0
+        if ctx.route_override === :exit
+            world.entity_route_overrides[ctx.entity_id] = -1
+        elseif ctx.route_override isa Integer && ctx.route_override > 0
+            world.entity_route_overrides[ctx.entity_id] = Int(ctx.route_override)
+        end
+    end
+
+    isempty(ctx.commands) && return nothing
+
+    for cmd in ctx.commands
+        op = cmd.op
+        if op == SimCore.OP_SET_SERVICE_TIME || op == SimCore.OP_ADD_SETUP_TIME
+            # If the entity already started service at time t, reschedule its ProcessComplete event!
+            uid = UInt64(max(0, cmd.target_id))
+            zid = Int(cmd.int_arg)
+            if uid > 0 && zid > 0 && haskey(configs, zid)
+                # Cancel any existing ProcessComplete for (uid, zid) in FEL
+                for (cev, _) in fel.queue
+                    if cev.inner isa ProcessComplete && cev.inner.entity_id == uid && cev.inner.station_id == zid
+                        cancel!(fel, cev.id)
+                    end
+                end
+                st = _compute_service_duration!(world, rng, zid, uid, configs[zid])
+                cev_id = schedule!(fel, ProcessComplete(uid, zid, t + st), t + st)
+                if haskey(world.entity_kinematics, uid)
+                    world.entity_kinematics[uid].exit_event_id = cev_id
+                end
+            end
+
+        elseif op == SimCore.OP_START_SERVICE
+            uid = UInt64(max(0, cmd.target_id))
+            zid = Int(cmd.int_arg)
+            dur = max(0.0001, cmd.float_arg)
+            if uid > 0 && zid > 0 && haskey(world.zone_states, zid)
+                zs = world.zone_states[zid]
+                qidx = findfirst(==(uid), zs.queue)
+                if qidx !== nothing
+                    deleteat!(zs.queue, qidx)
+                    zs.queue_length = length(zs.queue)
+                end
+                zs.busy_servers += 1
+                ag = get_des_agent(world, uid)
+                arr_t = ag !== nothing ? ag.arrival_time : t
+                prio  = ag !== nothing ? ag.priority : 0
+                world.des_agents[uid] = DESAgent(arr_t, zid, prio, t)
+                schedule!(fel, ProcessComplete(uid, zid, t + dur), t + dur)
+            end
+
+        elseif op == SimCore.OP_COMPLETE_SERVICE
+            uid = UInt64(max(0, cmd.target_id))
+            zid = Int(cmd.int_arg)
+            if uid > 0 && zid > 0
+                for (cev, _) in fel.queue
+                    if cev.inner isa ProcessComplete && cev.inner.entity_id == uid && cev.inner.station_id == zid
+                        cancel!(fel, cev.id)
+                    end
+                end
+                schedule!(fel, ProcessComplete(uid, zid, t), t)
+            end
+
+        elseif op == SimCore.OP_SCHEDULE_EVENT
+            zid = Int(cmd.target_id)
+            delay = max(0.0, cmd.float_arg)
+            interval = max(0.0, cmd.float_arg2)
+            payload, cb = cmd.any_arg isa Tuple ? cmd.any_arg : (cmd.any_arg, nothing)
+            ev = SimCore.CustomUserEvent(zid, cmd.str_arg, cmd.sym_arg, t + delay, payload, interval, cb)
+            cev_id = schedule!(fel, ev, t + delay)
+            if zid > 0
+                evs = get!(world.active_user_events, zid, Set{UInt64}())
+                push!(evs, cev_id)
+            end
+
+        elseif op == SimCore.OP_CANCEL_EVENT
+            cancel!(fel, UInt64(max(0, cmd.target_id)))
+
+        elseif op == SimCore.OP_FORWARD_ENTITY
+            uid = UInt64(max(0, cmd.target_id))
+            dest_z = Int(cmd.int_arg)
+            delay = max(0.0, cmd.float_arg)
+            zid = ctx.zone_id
+            if haskey(world.zone_states, zid)
+                zs = world.zone_states[zid]
+                qidx = findfirst(==(uid), zs.queue)
+                if qidx !== nothing
+                    deleteat!(zs.queue, qidx)
+                    zs.queue_length = length(zs.queue)
+                else
+                    zs.busy_servers = max(0, zs.busy_servers - 1)
+                end
+            end
+            ag = get_des_agent(world, uid)
+            prio = ag !== nothing ? ag.priority : 0
+            if dest_z > 0 && haskey(configs, dest_z)
+                world.des_agents[uid] = DESAgent(t + delay, dest_z, prio, Inf)
+                schedule!(fel, EntityArrival(uid, dest_z, t + delay, prio, false), t + delay)
+            else
+                _record_system_exit!(world, uid, ag !== nothing ? ag.arrival_time : t, t)
+            end
+
+        elseif op == SimCore.OP_SET_CONVEYOR_MODE
+            zid = Int(cmd.target_id)
+            if zid > 0 && haskey(configs, zid)
+                if cmd.sym_arg === :accumulating
+                    _recompute_accumulating_conveyor!(world, fel, configs, zid, configs[zid], t)
+                end
+            end
+
+        elseif op == SimCore.OP_SET_SPEED
+            if cmd.int_arg == 1
+                # Conveyor speed updated -> reschedule exit events for items on conveyor
+                zid = Int(cmd.target_id)
+                new_spd = cmd.float_arg
+                cmode = SimCore.get_zone_attribute(world, zid, "_conveyor_mode", :free_flow)
+                if cmode === :accumulating && haskey(configs, zid)
+                    _recompute_accumulating_conveyor!(world, fel, configs, zid, configs[zid], t)
+                else
+                    for (uid, k) in world.entity_kinematics
+                        if k.zone_id == zid
+                            if k.exit_event_id != 0
+                                cancel!(fel, k.exit_event_id)
+                                k.exit_event_id = UInt64(0)
+                            end
+                            if new_spd > 0.0
+                                rem = max(0.0, k.path_length - k.base_distance)
+                                dt = rem / new_spd
+                                k.exit_event_id = schedule!(fel, ProcessComplete(uid, zid, t + dt), t + dt)
+                            end
+                        end
+                    end
+                end
+            else
+                uid = UInt64(max(0, cmd.target_id))
+                new_spd = cmd.float_arg
+                k = get(world.entity_kinematics, uid, nothing)
+                if k !== nothing
+                    if k.exit_event_id != 0
+                        cancel!(fel, k.exit_event_id)
+                        k.exit_event_id = UInt64(0)
+                    end
+                    if new_spd > 0.0
+                        rem = max(0.0, k.path_length - k.base_distance)
+                        dt = rem / new_spd
+                        k.exit_event_id = schedule!(fel, ProcessComplete(uid, k.zone_id, t + dt), t + dt)
+                    end
+                end
+            end
+
+        elseif op == SimCore.OP_STEP_DISTANCE
+            zid = Int(cmd.target_id)
+            for (uid, k) in collect(world.entity_kinematics)
+                if k.zone_id == zid && k.base_distance >= k.path_length - 1e-6
+                    if k.exit_event_id == 0
+                        k.exit_event_id = schedule!(fel, ProcessComplete(uid, zid, t), t)
+                    end
+                end
+            end
+
+        elseif op == SimCore.OP_SPAWN_TO_PORT || op == SimCore.OP_CLONE_ENTITY
+            uid = UInt64(max(0, cmd.target_id))
+            dest_z = Int(cmd.int_arg)
+            prio = Int(SimCore.get_entity_attribute(world, uid, "priority", 0))
+            if dest_z > 0 && haskey(configs, dest_z)
+                schedule!(fel, EntityArrival(uid, dest_z, t, prio, false), t)
+            end
+
+        elseif op == SimCore.OP_DESTROY_ENTITY
+            uid = UInt64(max(0, cmd.target_id))
+            zid = Int(cmd.int_arg)
+            if haskey(world.zone_states, zid)
+                zs = world.zone_states[zid]
+                qidx = findfirst(==(uid), zs.queue)
+                if qidx !== nothing
+                    deleteat!(zs.queue, qidx)
+                    zs.queue_length = length(zs.queue)
+                end
+            end
+            for (cev, _) in fel.queue
+                if (cev.inner isa ProcessComplete || cev.inner isa EntityArrival) && cev.inner.entity_id == uid
+                    cancel!(fel, cev.id)
+                end
+            end
+            remove_des_agent!(world, uid)
+
+        elseif op == SimCore.OP_TRIGGER_FAILURE
+            zid = Int(cmd.target_id)
+            rep_dur = max(0.001, cmd.float_arg)
+            if zid > 0 && haskey(world.zone_states, zid)
+                zs = world.zone_states[zid]
+                zs.busy_servers = max(0, zs.busy_servers - 1)
+                zs.num_servers  = max(0, zs.num_servers - 1)
+                schedule!(fel, ScheduledChange{:Repair}(zid, t + rep_dur), t + rep_dur)
+            end
+
+        elseif op == SimCore.OP_TRIGGER_REPAIR
+            zid = Int(cmd.target_id)
+            if zid > 0 && haskey(world.zone_states, zid)
+                schedule!(fel, ScheduledChange{:Repair}(zid, t), t)
+            end
+
+        elseif op == SimCore.OP_FLUSH_QUEUE
+            zid = Int(cmd.target_id)
+            dest_z = Int(cmd.int_arg)
+            if zid > 0 && haskey(world.zone_states, zid)
+                zs = world.zone_states[zid]
+                flushed = copy(zs.queue)
+                empty!(zs.queue)
+                zs.queue_length = 0
+                for uid in flushed
+                    ag = get_des_agent(world, uid)
+                    prio = ag !== nothing ? ag.priority : 0
+                    if dest_z > 0 && haskey(configs, dest_z)
+                        world.des_agents[uid] = DESAgent(t, dest_z, prio, Inf)
+                        schedule!(fel, EntityArrival(uid, dest_z, t, prio, false), t)
+                    else
+                        _record_system_exit!(world, uid, ag !== nothing ? ag.arrival_time : t, t)
+                    end
+                end
+            end
+        end
+    end
+    empty!(ctx.commands)
+    return nothing
+end
+
