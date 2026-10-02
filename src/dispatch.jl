@@ -123,6 +123,17 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     # ── Time-average stats for interval since last event
     _update_time_averages!(world, zone, e.zone_id, t; pipeline=pipeline)
 
+    # ── Conveyor inlet: products are never placed on top of one another and never dropped;
+    #    an arrival that cannot enter waits with its feeder, and a source stays stalled meanwhile.
+    if _is_conveyor_zone(world, e.zone_id, cfg)
+        inlet_wait = _inlet_clear_delay(world, e.zone_id, cfg, t)
+        if zone.queue_length + zone.busy_servers >= cfg.capacity || inlet_wait > 0.0
+            _hold_at_feeder!(world, e, t)
+            _wake_feeder!(world, fel, e.zone_id, cfg, t)
+            return
+        end
+    end
+
     # ── Record system-entry time (first time we see this entity)
     is_first_entry = !haskey(world.entry_times, e.entity_id)
     if is_first_entry
@@ -185,20 +196,19 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
                 k = SimCore.EntityKinematics(e.zone_id, plen, 0.0, t; exit_event_id=UInt64(0))
                 k.nominal_speed = spd
                 world.entity_kinematics[e.entity_id] = k
-                if !Bool(SimCore.get_zone_attribute(world, e.zone_id, "_index_pulse_active", false))
-                    SimCore.set_zone_attribute!(world, e.zone_id, "_index_pulse_active", true)
-                    iv = max(1e-4, Float64(SimCore.get_zone_attribute(world, e.zone_id, "_conveyor_index_interval", cfg.conveyor_index_interval)))
-                    schedule!(fel, SimCore.CustomUserEvent(e.zone_id, "", :_index_pulse, t + iv; interval=iv), t + iv)
-                end
+                _ensure_index_pulse!(world, fel, e.zone_id, cfg, t)
             else
+                # Free-flow belt that is halted by a blocked outlet carries new products at rest.
+                halted = cmode === :free_flow && _is_conveyor_zone(world, e.zone_id, cfg) && _belt_halted(world, e.zone_id)
                 service_time = _compute_service_duration!(world, rng, e.zone_id, e.entity_id, cfg)
-                cev_id = schedule!(fel, ProcessComplete(e.entity_id, e.zone_id, t + service_time),
-                                   t + service_time)
-                if cmode === :accumulating || !isempty(world.entity_kinematics) || !isempty(world.zone_attributes)
+                cev_id = halted ? UInt64(0) :
+                         schedule!(fel, ProcessComplete(e.entity_id, e.zone_id, t + service_time), t + service_time)
+                if cfg.is_conveyor || cmode !== :free_flow || !isempty(world.entity_kinematics) || !isempty(world.zone_attributes)
                     plen = Float64(SimCore.get_zone_attribute(world, e.zone_id, "_path_length", cfg.path_length))
                     spd  = Float64(SimCore.get_zone_attribute(world, e.zone_id, "_nominal_speed", cfg.nominal_speed))
-                    world.entity_kinematics[e.entity_id] =
-                        SimCore.EntityKinematics(e.zone_id, plen, spd, t; exit_event_id=cev_id)
+                    k = SimCore.EntityKinematics(e.zone_id, plen, spd, t; exit_event_id=cev_id)
+                    halted && (k.current_speed = 0.0)
+                    world.entity_kinematics[e.entity_id] = k
                     if cmode === :accumulating
                         _recompute_accumulating_conveyor!(world, fel, configs, e.zone_id, cfg, t)
                     end
@@ -215,6 +225,7 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
 
     # ── Schedule next arrival from this zone's Poisson/NHPP process.
     e.is_external && _schedule_next_arrival!(world, fel, configs, rng, e.zone_id, cfg, t)
+    _is_conveyor_zone(world, e.zone_id, cfg) && _wake_feeder!(world, fel, e.zone_id, cfg, t)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -237,19 +248,21 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     # ── Time-average stats for interval since last event
     _update_time_averages!(world, zone, e.station_id, t; pipeline=pipeline)
 
-    # ── Check accumulating conveyor blocking before departure
+    # ── Any conveyor holds its outlet item while a fixed-route destination is full.
     cmode = !isempty(world.zone_attributes) ?
             SimCore.get_zone_attribute(world, e.station_id, "_conveyor_mode", cfg.conveyor_mode) :
             cfg.conveyor_mode
-    if cmode === :accumulating && _is_downstream_blocked(world, configs, e.station_id, cfg)
-        k = get(world.entity_kinematics, e.entity_id, nothing)
-        if k !== nothing
-            k.base_distance = k.path_length
-            k.current_speed = 0.0
-            k.last_update_time = t
-            k.exit_event_id = UInt64(0)
-        end
-        _recompute_accumulating_conveyor!(world, fel, configs, e.station_id, cfg, t)
+    is_conveyor = _is_conveyor_zone(world, e.station_id, cfg)
+    # Every internal transfer is lossless: the product waits where it is until a destination accepts it.
+    override = isempty(world.entity_route_overrides) ? nothing : get(world.entity_route_overrides, e.entity_id, nothing)
+    lossless = !(cfg.routing isa ExitSystem) || override !== nothing
+    outlet_wait = if override !== nothing
+        override > 0 ? _dest_wait(world, configs, Int(override), t) : 0.0
+    else
+        lossless ? _outlet_wait(world, configs, e.station_id, cfg, t) : 0.0
+    end
+    if outlet_wait > 0.0
+        _hold_outlet!(world, fel, configs, e.entity_id, e.station_id, cfg, cmode, outlet_wait, t)
         return
     end
 
@@ -275,7 +288,8 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
             record_departure!(world.stats, wait_time, zone_sojourn)
             _record_departure_optional!(pipeline, wait_time, zone_sojourn)
             _record_zone_departure!(world, e.station_id, wait_time, zone_sojourn)
-            route_outcome = _route_entity!(world, fel, configs, rng, e.entity_id, agent, cfg, t, wait_time)
+            route_outcome = _route_entity!(world, fel, configs, rng, e.entity_id, agent, cfg, t, wait_time,
+                                           lossless ? _open_routing(world, configs, rng, cfg, t) : cfg.routing)
             if haskey(world.zone_stats, 0)
                 prio_key = -100 - agent.priority
                 pstats = get!(world.zone_stats, prio_key) do
@@ -324,9 +338,10 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     if cmode === :accumulating
         _recompute_accumulating_conveyor!(world, fel, configs, e.station_id, cfg, t)
     end
-    if !isempty(world.entity_kinematics)
-        _unblock_upstream_accumulating_conveyors!(world, fel, configs, e.station_id, t)
+    if !isempty(world.entity_kinematics) || !isempty(world.zone_attributes)
+        _release_upstream!(world, fel, configs, e.station_id, t)
     end
+    is_conveyor && _wake_feeder!(world, fel, e.station_id, cfg, t)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -403,6 +418,7 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
         ttf = rand(rng, Exponential(1.0 / cfg.failures.α))
         schedule!(fel, ResourceFailure(e.zone_id, 1.0f0, t + ttf), t + ttf)
     end
+    (!isempty(world.entity_kinematics) || !isempty(world.zone_attributes)) && _release_upstream!(world, fel, configs, e.zone_id, t)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -521,7 +537,8 @@ Route or remove an entity based on the zone's `RoutingPolicy`.
 function _route_entity!(world::SimWorld, fel::FutureEventList,
                         configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
                         entity_id::UInt64, agent::DESAgent,
-                        cfg::ZoneConfig, t::Float64, wait_time::Float64=0.0)
+                        cfg::ZoneConfig, t::Float64, wait_time::Float64=0.0,
+                        routing::RoutingPolicy=cfg.routing)
     # I-2: Check for hook-level one-shot route_to! override first
     if !isempty(world.entity_route_overrides) && haskey(world.entity_route_overrides, entity_id)
         dest_override = pop!(world.entity_route_overrides, entity_id)
@@ -536,12 +553,12 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
         end
     end
 
-    if cfg.routing isa ExitSystem
+    if routing isa ExitSystem
         _record_system_exit!(world, entity_id, agent.arrival_time, t, wait_time)
         return :exit
 
-    elseif cfg.routing isa FixedRoute
-        dest = cfg.routing.to
+    elseif routing isa FixedRoute
+        dest = routing.to
         _record_routed_wait!(world, wait_time)
         # Keep entity in world; update current_zone for DESAgent
         world.des_agents[entity_id] = DESAgent(t, dest, agent.priority, Inf)
@@ -549,8 +566,8 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
         schedule!(fel, EntityArrival(entity_id, dest, t, agent.priority, false), t)
         return :routed
 
-    elseif cfg.routing isa ProbRoute
-        dest = sample_destination(cfg.routing, rng)
+    elseif routing isa ProbRoute
+        dest = sample_destination(routing, rng)
         if dest === nothing
             _record_system_exit!(world, entity_id, agent.arrival_time, t, wait_time)
             return :exit
@@ -562,8 +579,8 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
             return :routed
         end
 
-    elseif cfg.routing isa ShortestQueueRoute
-        cands = cfg.routing.candidates
+    elseif routing isa ShortestQueueRoute
+        cands = routing.candidates
         if isempty(cands)
             _record_system_exit!(world, entity_id, agent.arrival_time, t, wait_time)
             return :exit
@@ -586,27 +603,27 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
         schedule!(fel, EntityArrival(entity_id, best_dest, t, agent.priority, false), t)
         return :routed
 
-    elseif cfg.routing isa RoundRobinRoute
-        cands = cfg.routing.candidates
+    elseif routing isa RoundRobinRoute
+        cands = routing.candidates
         if isempty(cands)
             _record_system_exit!(world, entity_id, agent.arrival_time, t, wait_time)
             return :exit
         end
-        idx = mod1(cfg.routing.cursor + 1, length(cands))
-        cfg.routing.cursor = idx
+        idx = mod1(routing.cursor + 1, length(cands))
+        routing.cursor = idx
         dest = cands[idx]
         _record_routed_wait!(world, wait_time)
         world.des_agents[entity_id] = DESAgent(t, dest, agent.priority, Inf)
         schedule!(fel, EntityArrival(entity_id, dest, t, agent.priority, false), t)
         return :routed
 
-    elseif cfg.routing isa DynamicPolicyRoute
-        cands = cfg.routing.candidates
+    elseif routing isa DynamicPolicyRoute
+        cands = routing.candidates
         if isempty(cands)
             _record_system_exit!(world, entity_id, agent.arrival_time, t, wait_time)
             return :exit
         end
-        dest = cfg.routing.policy_fn(world, entity_id, agent, cands)
+        dest = routing.policy_fn(world, entity_id, agent, cands)
         if dest === nothing || dest <= 0
             _record_system_exit!(world, entity_id, agent.arrival_time, t, wait_time)
             return :exit
@@ -874,24 +891,326 @@ _mean_service_time(cfg::ZoneConfig) = mean(cfg.service_dist.dist)
     return max(0.0001, base_st + extra_setup)
 end
 
-function _is_downstream_blocked(
-    world::SimWorld,
-    configs::Dict{Int, ZoneConfig},
-    station_id::Int,
-    cfg::ZoneConfig
-)::Bool
-    if cfg.routing isa FixedRoute
-        dest_id = cfg.routing.to
-        if haskey(world.zone_states, dest_id)
-            dz = world.zone_states[dest_id]
-            dcfg = get(configs, dest_id, nothing)
-            cap = dcfg !== nothing ? min(dz.capacity, dcfg.capacity) : dz.capacity
-            if dz.num_servers == 0 || (dz.queue_length + dz.busy_servers) >= cap
-                return true
-            end
-        end
+_is_conveyor_zone(world::SimWorld, zone_id::Int, cfg::ZoneConfig)::Bool =
+    cfg.is_conveyor || (!isempty(world.zone_attributes) &&
+                        Bool(SimCore.get_zone_attribute(world, zone_id, "_is_conveyor", false)))
+
+# Centre-to-centre distance between neighbouring products: footprint (pitch) plus the commanded gap.
+function _conveyor_spacing(world::SimWorld, zone_id::Int, cfg::ZoneConfig)::Float64
+    cmode = SimCore.get_zone_attribute(world, zone_id, "_conveyor_mode", cfg.conveyor_mode)
+    pitch = Float64(SimCore.get_zone_attribute(world, zone_id, "_conveyor_pitch", cfg.conveyor_pitch))
+    cmode === :free_flow && return pitch
+    return pitch + Float64(SimCore.get_zone_attribute(world, zone_id, "_conveyor_gap", cfg.conveyor_gap))
+end
+
+# A free-flow belt is halted when its items were frozen by a blocked outlet.
+function _belt_halted(world::SimWorld, zone_id::Int)::Bool
+    for (_, k) in world.entity_kinematics
+        k.zone_id == zone_id && k.current_speed == 0.0 && k.exit_event_id == 0 && return true
     end
     return false
+end
+
+# Seconds until the conveyor inlet can take another product: 0 = clear now, Inf = not before a release.
+function _inlet_clear_delay(world::SimWorld, zone_id::Int, cfg::ZoneConfig, t::Float64)::Float64
+    isempty(world.entity_kinematics) && return 0.0
+    rear = Inf
+    rear_speed = 0.0
+    for (_, k) in world.entity_kinematics
+        k.zone_id == zone_id || continue
+        d = SimCore.kinematics_distance(k, t)
+        if d < rear
+            rear = d
+            rear_speed = k.current_speed
+        end
+    end
+    spacing = _conveyor_spacing(world, zone_id, cfg)
+    rear >= spacing - 1e-9 && return 0.0
+    cmode = SimCore.get_zone_attribute(world, zone_id, "_conveyor_mode", cfg.conveyor_mode)
+    if cmode === :indexing
+        Bool(SimCore.get_zone_attribute(world, zone_id, "_index_pulse_active", false)) || return Inf
+        return max(1e-4, Float64(SimCore.get_zone_attribute(world, zone_id, "_conveyor_index_interval", cfg.conveyor_index_interval)))
+    end
+    return rear_speed > 0.0 ? (spacing - rear) / rear_speed : Inf
+end
+
+const _NO_DESTS = Int[]
+_routing_dests(::ExitSystem) = (_NO_DESTS, true)
+_routing_dests(r::FixedRoute) = ([r.to], false)
+_routing_dests(r::ShortestQueueRoute) = (r.candidates, false)
+_routing_dests(r::RoundRobinRoute) = (r.candidates, false)
+_routing_dests(r::DynamicPolicyRoute) = (r.candidates, false)
+_routing_dests(::RoutingPolicy) = (_NO_DESTS, true)
+function _routing_dests(r::ProbRoute)
+    dests = Int[]
+    can_exit = sum(p for (_, p) in r.choices; init=0.0) < 1.0 - 1e-12
+    for (d, p) in r.choices
+        p > 0.0 || continue
+        d === nothing ? (can_exit = true) : push!(dests, d)
+    end
+    return dests, can_exit
+end
+
+# Seconds until `dest_id` can accept a product: 0 = open, Inf = not before it releases capacity.
+function _dest_wait(world::SimWorld, configs::Dict{Int, ZoneConfig}, dest_id::Int, t::Float64)::Float64
+    haskey(world.zone_states, dest_id) || return 0.0
+    dz = world.zone_states[dest_id]
+    dcfg = get(configs, dest_id, nothing)
+    cap = dcfg !== nothing ? min(dz.capacity, dcfg.capacity) : dz.capacity
+    # A failed server takes its slot out of service.
+    failed = dcfg !== nothing ? max(0, dcfg.num_servers - dz.num_servers) : 0
+    (dz.queue_length + dz.busy_servers) >= cap - failed && return Inf
+    if dcfg !== nothing && _is_conveyor_zone(world, dest_id, dcfg)
+        return _inlet_clear_delay(world, dest_id, dcfg, t)
+    end
+    return 0.0
+end
+
+# Wait imposed by a hook-chosen destination (`route_to!`) on a product waiting at the outlet; nothing if none.
+function _override_wait(world::SimWorld, configs::Dict{Int, ZoneConfig}, station_id::Int,
+                        cfg::ZoneConfig, t::Float64)::Union{Nothing, Float64}
+    isempty(world.entity_route_overrides) && return nothing
+    is_conv = _is_conveyor_zone(world, station_id, cfg)
+    parked = SimCore.get_zone_attribute(world, station_id, "_parked", nothing)
+    best = nothing
+    for (uid, dest) in world.entity_route_overrides
+        agent = get_des_agent(world, uid)
+        (agent === nothing || agent.current_zone != station_id) && continue
+        waiting = parked !== nothing && uid in parked
+        if !waiting && is_conv
+            k = get(world.entity_kinematics, uid, nothing)
+            waiting = k !== nothing && k.zone_id == station_id && k.exit_event_id == 0 && k.base_distance >= k.path_length - 1e-6
+        end
+        waiting || continue
+        w = dest > 0 ? _dest_wait(world, configs, Int(dest), t) : 0.0
+        best = best === nothing ? w : max(best, w)
+    end
+    return best
+end
+
+function _held_override_to(world::SimWorld, zone_id::Int, freed_zone_id::Int)::Bool
+    isempty(world.entity_route_overrides) && return false
+    for (uid, dest) in world.entity_route_overrides
+        dest == freed_zone_id || continue
+        agent = get_des_agent(world, uid)
+        agent !== nothing && agent.current_zone == zone_id && return true
+    end
+    return false
+end
+
+# Seconds until some destination of the station's routing can accept a product.
+function _outlet_wait(world::SimWorld, configs::Dict{Int, ZoneConfig}, station_id::Int,
+                      cfg::ZoneConfig, t::Float64)::Float64
+    ow = _override_wait(world, configs, station_id, cfg, t)
+    ow === nothing || return ow
+    cfg.routing isa FixedRoute && return _dest_wait(world, configs, cfg.routing.to, t)
+    dests, can_exit = _routing_dests(cfg.routing)
+    (can_exit || isempty(dests)) && return 0.0
+    best = Inf
+    for d in dests
+        w = _dest_wait(world, configs, d, t)
+        w < best && (best = w)
+        best == 0.0 && break
+    end
+    return best
+end
+
+# Resolves a multi-destination routing to one that can accept the product now.
+function _open_routing(world::SimWorld, configs::Dict{Int, ZoneConfig}, rng::AbstractRNG,
+                       cfg::ZoneConfig, t::Float64)::RoutingPolicy
+    r = cfg.routing
+    is_open(d) = _dest_wait(world, configs, d, t) == 0.0
+    (r isa FixedRoute || r isa ExitSystem) && return r
+    dests, _ = _routing_dests(r)
+    all(is_open, dests) && return r   # nothing blocked: keep the routing's own sampling
+    if r isa ProbRoute
+        opts = Tuple{Union{Int,Nothing}, Float64}[]
+        total = 0.0
+        for (d, p) in r.choices
+            (p > 0.0 && (d === nothing || is_open(d))) || continue
+            push!(opts, (d, p)); total += p
+        end
+        resid = 1.0 - sum(p for (_, p) in r.choices; init=0.0)
+        if resid > 1e-12
+            push!(opts, (nothing, resid)); total += resid
+        end
+        isempty(opts) && return r
+        u = rand(rng) * total
+        cum = 0.0
+        for (d, p) in opts
+            cum += p
+            u < cum && return d === nothing ? ExitSystem() : FixedRoute(d)
+        end
+        d = opts[end][1]
+        return d === nothing ? ExitSystem() : FixedRoute(d)
+    elseif r isa RoundRobinRoute
+        n = length(r.candidates)
+        for i in 1:n
+            idx = mod1(r.cursor + i, n)
+            if is_open(r.candidates[idx])
+                r.cursor = idx
+                return FixedRoute(r.candidates[idx])
+            end
+        end
+    elseif r isa ShortestQueueRoute
+        open = filter(is_open, r.candidates)
+        isempty(open) || return ShortestQueueRoute(open)
+    elseif r isa DynamicPolicyRoute
+        open = filter(is_open, r.candidates)
+        isempty(open) || return DynamicPolicyRoute(open, r.policy_fn)
+    end
+    return r
+end
+
+function _attr_list!(world::SimWorld, zone_id::Int, key::String, ::Type{T}) where {T}
+    v = SimCore.get_zone_attribute(world, zone_id, key, nothing)
+    if v === nothing
+        v = T[]
+        SimCore.set_zone_attribute!(world, zone_id, key, v)
+    end
+    return v::Vector{T}
+end
+
+function _has_parked(world::SimWorld, zone_id::Int)::Bool
+    p = SimCore.get_zone_attribute(world, zone_id, "_parked", nothing)
+    return p !== nothing && !isempty(p)
+end
+
+# An arrival that cannot enter a conveyor waits with its feeder; the source stays stalled meanwhile.
+function _hold_at_feeder!(world::SimWorld, e::EntityArrival, t::Float64)
+    if !haskey(world.entry_times, e.entity_id)
+        world.entry_times[e.entity_id] = t
+        sys_zs = get(world.zone_stats, 0, nothing)
+        sys_zs !== nothing && record_arrival!(sys_zs)
+    end
+    push!(_attr_list!(world, e.zone_id, "_feeder_wait", EntityArrival), e)
+    return nothing
+end
+
+# Schedules the next held arrival for the moment the conveyor can take it.
+function _wake_feeder!(world::SimWorld, fel::FutureEventList, zone_id::Int, cfg::ZoneConfig, t::Float64)
+    held = SimCore.get_zone_attribute(world, zone_id, "_feeder_wait", nothing)
+    (held === nothing || isempty(held)) && return nothing
+    zone = world.zone_states[zone_id]
+    zone.queue_length + zone.busy_servers >= cfg.capacity && return nothing
+    w = _inlet_clear_delay(world, zone_id, cfg, t)
+    isfinite(w) || return nothing
+    due = t + w
+    pending = Float64(SimCore.get_zone_attribute(world, zone_id, "_feeder_retry_at", -1.0))
+    t + 1e-12 < pending <= due + 1e-12 && return nothing
+    SimCore.set_zone_attribute!(world, zone_id, "_feeder_retry_at", due)
+    schedule!(fel, SimCore.CustomUserEvent(zone_id, "", :_feeder_retry, due), due)
+    return nothing
+end
+
+# Freezes every product on a free-flow belt; a rigid belt cannot move any product past a stopped one.
+function _halt_belt!(world::SimWorld, fel::FutureEventList, zone_id::Int, t::Float64)
+    for (_, k) in world.entity_kinematics
+        k.zone_id == zone_id || continue
+        k.base_distance = SimCore.kinematics_distance(k, t)
+        k.last_update_time = t
+        k.current_speed = 0.0
+        if k.exit_event_id != 0
+            cancel!(fel, k.exit_event_id)
+            k.exit_event_id = UInt64(0)
+        end
+    end
+    return nothing
+end
+
+function _resume_belt!(world::SimWorld, fel::FutureEventList, zone_id::Int, cfg::ZoneConfig, t::Float64)
+    spd  = max(0.001, Float64(SimCore.get_zone_attribute(world, zone_id, "_nominal_speed", cfg.nominal_speed)))
+    for (uid, k) in world.entity_kinematics
+        (k.zone_id == zone_id && k.current_speed == 0.0 && k.exit_event_id == 0) || continue
+        k.last_update_time = t
+        k.current_speed = spd
+        dt = max(0.0, k.path_length - k.base_distance) / spd
+        k.exit_event_id = schedule!(fel, ProcessComplete(uid, zone_id, t + dt), t + dt)
+    end
+    return nothing
+end
+
+function _ensure_index_pulse!(world::SimWorld, fel::FutureEventList, zone_id::Int, cfg::ZoneConfig, t::Float64)
+    Bool(SimCore.get_zone_attribute(world, zone_id, "_index_pulse_active", false)) && return nothing
+    SimCore.set_zone_attribute!(world, zone_id, "_index_pulse_active", true)
+    iv = max(1e-4, Float64(SimCore.get_zone_attribute(world, zone_id, "_conveyor_index_interval", cfg.conveyor_index_interval)))
+    schedule!(fel, SimCore.CustomUserEvent(zone_id, "", :_index_pulse, t + iv; interval=iv), t + iv)
+    return nothing
+end
+
+function _schedule_outlet_retry!(fel::FutureEventList, zone_id::Int, wait::Float64, t::Float64)
+    isfinite(wait) || return nothing
+    schedule!(fel, SimCore.CustomUserEvent(zone_id, "", :_outlet_retry, t + wait), t + wait)
+    return nothing
+end
+
+# The finished product stays where it is (belt or server slot) until a destination can accept it.
+function _hold_outlet!(world::SimWorld, fel::FutureEventList, configs::Dict{Int, ZoneConfig},
+                       entity_id::UInt64, zone_id::Int, cfg::ZoneConfig, cmode::Symbol,
+                       wait::Float64, t::Float64)
+    if _is_conveyor_zone(world, zone_id, cfg)
+        k = get(world.entity_kinematics, entity_id, nothing)
+        if k !== nothing
+            k.base_distance = k.path_length
+            k.current_speed = 0.0
+            k.last_update_time = t
+            k.exit_event_id = UInt64(0)
+        end
+        if cmode === :accumulating
+            _recompute_accumulating_conveyor!(world, fel, configs, zone_id, cfg, t)
+        elseif cmode !== :indexing
+            _halt_belt!(world, fel, zone_id, t)
+        end
+    else
+        parked = _attr_list!(world, zone_id, "_parked", UInt64)
+        entity_id in parked || push!(parked, entity_id)
+    end
+    _schedule_outlet_retry!(fel, zone_id, wait, t)
+    return nothing
+end
+
+# Retries a held outlet handoff once a destination can accept the product.
+function _release_outlet!(world::SimWorld, fel::FutureEventList, configs::Dict{Int, ZoneConfig},
+                          zone_id::Int, cfg::ZoneConfig, t::Float64)
+    wait = _outlet_wait(world, configs, zone_id, cfg, t)
+    if wait > 0.0
+        _schedule_outlet_retry!(fel, zone_id, wait, t)
+        return nothing
+    end
+    if !_is_conveyor_zone(world, zone_id, cfg)
+        parked = SimCore.get_zone_attribute(world, zone_id, "_parked", nothing)
+        if parked !== nothing && !isempty(parked)
+            for uid in parked
+                schedule!(fel, ProcessComplete(uid, zone_id, t), t)
+            end
+            empty!(parked)
+        end
+        return nothing
+    end
+    cmode = SimCore.get_zone_attribute(world, zone_id, "_conveyor_mode", cfg.conveyor_mode)
+    restarted = false
+    if cmode === :accumulating
+        restarted = any(k -> k.zone_id == zone_id && k.current_speed == 0.0, values(world.entity_kinematics))
+        _recompute_accumulating_conveyor!(world, fel, configs, zone_id, cfg, t)
+    elseif cmode === :indexing
+        for (uid, k) in world.entity_kinematics
+            if k.zone_id == zone_id && k.exit_event_id == 0 && k.base_distance >= k.path_length - 1e-6
+                k.last_update_time = t
+                k.exit_event_id = schedule!(fel, ProcessComplete(uid, zone_id, t), t)
+                restarted = true
+            end
+        end
+        if any(k -> k.zone_id == zone_id, values(world.entity_kinematics))
+            restarted |= !Bool(SimCore.get_zone_attribute(world, zone_id, "_index_pulse_active", false))
+            _ensure_index_pulse!(world, fel, zone_id, cfg, t)
+        end
+    else
+        restarted = _belt_halted(world, zone_id)
+        _resume_belt!(world, fel, zone_id, cfg, t)
+    end
+    # A belt that moves again opens room for its feeders; an event avoids recursion around loops.
+    restarted && schedule!(fel, SimCore.CustomUserEvent(zone_id, "", :_upstream_wake, t), t)
+    return nothing
 end
 
 function _recompute_accumulating_conveyor!(
@@ -902,10 +1221,11 @@ function _recompute_accumulating_conveyor!(
     cfg::ZoneConfig,
     t::Float64
 )
-    pitch = Float64(SimCore.get_zone_attribute(world, zone_id, "_conveyor_pitch", cfg.conveyor_pitch))
+    spacing = _conveyor_spacing(world, zone_id, cfg)
     plen  = Float64(SimCore.get_zone_attribute(world, zone_id, "_path_length", cfg.path_length))
     spd   = max(0.001, Float64(SimCore.get_zone_attribute(world, zone_id, "_nominal_speed", cfg.nominal_speed)))
-    blocked_out = _is_downstream_blocked(world, configs, zone_id, cfg)
+    wait = _outlet_wait(world, configs, zone_id, cfg, t)
+    blocked_out = wait > 0.0
 
     # Collect all items currently on this conveyor
     items = Tuple{UInt64, SimCore.EntityKinematics, Float64}[]
@@ -920,60 +1240,43 @@ function _recompute_accumulating_conveyor!(
     # Sort from front (closest to outlet, highest distance) to back (lowest distance)
     sort!(items, by = x -> (-x[3], x[1]))
 
+    next_stop = Inf
     for (idx, (uid, k, d_now)) in enumerate(items)
-        stop_pos = max(0.0, plen - (idx - 1) * pitch)
-        k.base_distance = min(d_now, stop_pos)
+        # Resting slot when the outlet is blocked: packed behind the leader at `spacing`.
+        stop_pos = max(0.0, plen - (idx - 1) * spacing)
+        k.base_distance = d_now
         k.last_update_time = t
+        if k.exit_event_id != 0
+            cancel!(fel, k.exit_event_id)
+            k.exit_event_id = UInt64(0)
+        end
 
-        if idx == 1 && !blocked_out
-            # Leading item and downstream is open -> move to outlet atplen
-            rem_dist = max(0.0, plen - k.base_distance)
+        if !blocked_out
             k.current_speed = spd
-            if k.exit_event_id != 0
-                cancel!(fel, k.exit_event_id)
-            end
-            dt = rem_dist / spd
+            dt = max(0.0, plen - d_now) / spd
             k.exit_event_id = schedule!(fel, ProcessComplete(uid, zone_id, t + dt), t + dt)
+        elseif d_now >= stop_pos - 1e-6
+            k.base_distance = min(d_now, stop_pos)
+            k.current_speed = 0.0
         else
-            # Either downstream is blocked OR we are behind another item
-            # Check if leader is stopped or moving
-            leader_stopped = (idx == 1 && blocked_out) || (idx > 1 && items[idx - 1][2].current_speed == 0.0)
-            if leader_stopped
-                if k.base_distance >= stop_pos - 1e-4
-                    # Reached accumulation slot -> stop!
-                    k.base_distance = stop_pos
-                    k.current_speed = 0.0
-                    if k.exit_event_id != 0
-                        cancel!(fel, k.exit_event_id)
-                        k.exit_event_id = UInt64(0)
-                    end
-                else
-                    # Still moving toward stop_pos; cancel exit event if it would overshoot
-                    k.current_speed = spd
-                    if k.exit_event_id != 0
-                        cancel!(fel, k.exit_event_id)
-                        k.exit_event_id = UInt64(0)
-                    end
-                    # Schedule an internal arrival at the stop position via CustomUserEvent
-                    dt_stop = (stop_pos - k.base_distance) / spd
-                    schedule!(fel, SimCore.CustomUserEvent(zone_id, "", :_accum_check, t + dt_stop), t + dt_stop)
-                end
-            else
-                # Leader is moving toward outlet
-                rem_dist = max(0.0, plen - k.base_distance)
-                k.current_speed = spd
-                if k.exit_event_id != 0
-                    cancel!(fel, k.exit_event_id)
-                end
-                dt = rem_dist / spd + (idx - 1) * (pitch / spd)
-                k.exit_event_id = schedule!(fel, ProcessComplete(uid, zone_id, t + dt), t + dt)
-            end
+            k.current_speed = spd
+            next_stop = min(next_stop, (stop_pos - d_now) / spd)
         end
     end
+    if isfinite(next_stop)
+        # One pending check per belt: every product that is still moving re-arms it when it fires.
+        due = t + next_stop
+        pending = Float64(SimCore.get_zone_attribute(world, zone_id, "_accum_check_at", -1.0))
+        if !(t + 1e-12 < pending <= due + 1e-12)
+            SimCore.set_zone_attribute!(world, zone_id, "_accum_check_at", due)
+            schedule!(fel, SimCore.CustomUserEvent(zone_id, "", :_accum_check, due), due)
+        end
+    end
+    blocked_out && _schedule_outlet_retry!(fel, zone_id, wait, t)
     return nothing
 end
 
-function _unblock_upstream_accumulating_conveyors!(
+function _release_upstream!(
     world::SimWorld,
     fel::FutureEventList,
     configs::Dict{Int, ZoneConfig},
@@ -981,13 +1284,11 @@ function _unblock_upstream_accumulating_conveyors!(
     t::Float64
 )
     for (uzid, ucfg) in configs
-        cmode = !isempty(world.zone_attributes) ?
-                SimCore.get_zone_attribute(world, uzid, "_conveyor_mode", ucfg.conveyor_mode) :
-                ucfg.conveyor_mode
-        if cmode === :accumulating && ucfg.routing isa FixedRoute && ucfg.routing.to == freed_zone_id
-            if !_is_downstream_blocked(world, configs, uzid, ucfg)
-                _recompute_accumulating_conveyor!(world, fel, configs, uzid, ucfg, t)
-            end
+        uzid == freed_zone_id && continue
+        dests, _ = _routing_dests(ucfg.routing)
+        (freed_zone_id in dests || _held_override_to(world, uzid, freed_zone_id)) || continue
+        if _is_conveyor_zone(world, uzid, ucfg) || _has_parked(world, uzid)
+            _release_outlet!(world, fel, configs, uzid, ucfg, t)
         end
     end
     return nothing
@@ -1004,6 +1305,8 @@ function _try_pull_from_upstream_queues!(
     t::Float64
 )
     zone.busy_servers >= zone.num_servers && return nothing
+    # A belt is fed only through its inlet; pulling from a queue would skip admission and carry no position.
+    _is_conveyor_zone(world, station_id, cfg) && return nothing
     pd = world.port_directory
     h = get(pd.zone_to_handle, station_id, SimCore.INVALID_HANDLE)
     !isvalid(h) && return nothing
@@ -1058,15 +1361,19 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
                 SimCore.get_zone_attribute(world, e.zone_id, "_conveyor_mode", cfg.conveyor_mode) :
                 cfg.conveyor_mode
         if cmode === :indexing
-            pitch = Float64(SimCore.get_zone_attribute(world, e.zone_id, "_conveyor_pitch", cfg.conveyor_pitch))
+            step = _conveyor_spacing(world, e.zone_id, cfg)
+            items = [(uid, k) for (uid, k) in world.entity_kinematics if k.zone_id == e.zone_id]
+            # Rigid bed: nothing advances while a product waits at a blocked outlet.
+            held = any(it -> it[2].exit_event_id == 0 && SimCore.kinematics_distance(it[2], t) >= it[2].path_length - 1e-9, items)
             has_remaining = false
-            for (uid, ag) in world.des_agents
-                if ag.current_zone == e.zone_id && haskey(world.entity_kinematics, uid)
-                    k = world.entity_kinematics[uid]
-                    new_d = clamp(SimCore.kinematics_distance(k, t) + pitch, 0.0, k.path_length)
+            if !held
+                for (uid, k) in items
+                    k.exit_event_id != 0 && continue
+                    new_d = min(k.path_length, SimCore.kinematics_distance(k, t) + step)
                     k.base_distance = new_d
                     k.last_update_time = t
-                    if new_d >= k.path_length - 1e-9 && k.exit_event_id == 0
+                    k.current_speed = 0.0
+                    if new_d >= k.path_length - 1e-9
                         k.exit_event_id = schedule!(fel, ProcessComplete(uid, e.zone_id, t), t)
                     else
                         has_remaining = true
@@ -1081,6 +1388,25 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
             end
         else
             SimCore.set_zone_attribute!(world, e.zone_id, "_index_pulse_active", false)
+        end
+        return nothing
+    elseif e.tag === :_outlet_retry && e.zone_id > 0 && haskey(configs, e.zone_id)
+        _release_outlet!(world, fel, configs, e.zone_id, configs[e.zone_id], t)
+        return nothing
+    elseif e.tag === :_upstream_wake && e.zone_id > 0 && haskey(configs, e.zone_id)
+        _release_upstream!(world, fel, configs, e.zone_id, t)
+        _wake_feeder!(world, fel, e.zone_id, configs[e.zone_id], t)
+        return nothing
+    elseif e.tag === :_feeder_retry && e.zone_id > 0 && haskey(configs, e.zone_id)
+        fcfg = configs[e.zone_id]
+        held = SimCore.get_zone_attribute(world, e.zone_id, "_feeder_wait", nothing)
+        if held !== nothing && !isempty(held)
+            fzone = world.zone_states[e.zone_id]
+            if fzone.queue_length + fzone.busy_servers < fcfg.capacity && _inlet_clear_delay(world, e.zone_id, fcfg, t) == 0.0
+                dispatch!(world, fel, configs, rng, popfirst!(held), t; pipeline=pipeline, sync_bufs=sync_bufs)
+            else
+                _wake_feeder!(world, fel, e.zone_id, fcfg, t)
+            end
         end
         return nothing
     end

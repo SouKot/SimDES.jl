@@ -410,6 +410,237 @@ end
         @test sm.total_events   > 0
     end
 
+    @testset "Conveyor outlet backpressure waits for downstream server in every mode" begin
+        for mode in (:free_flow, :accumulating, :indexing)
+            world = SimWorld()
+            fel = FutureEventList()
+            conveyor = ZoneConfig(
+                id=1, num_servers=1, capacity=1,
+                service_dist=deterministic_service(1.0),
+                routing=FixedRoute(2),
+                conveyor_mode=mode,
+                conveyor_pitch=0.5,
+                conveyor_index_interval=1.0,
+                path_length=1.0,
+                nominal_speed=1.0,
+                is_conveyor=true
+            )
+            server = ZoneConfig(
+                id=2, num_servers=1, capacity=1,
+                service_dist=deterministic_service(10.0),
+                routing=ExitSystem()
+            )
+            configs = Dict(1 => conveyor, 2 => server)
+            build_world!(world, conveyor, server)
+            rng = MersenneTwister(700 + findfirst(==(mode), [:free_flow, :accumulating, :indexing]))
+            clock = SimClock(Inf)
+            busy_entity = new_entity_id!(world)
+            conveyor_entity = new_entity_id!(world)
+            schedule!(fel, EntityArrival(busy_entity, 2, 0.0), 0.0)
+            schedule!(fel, EntityArrival(conveyor_entity, 1, 0.0), 0.0)
+
+            sim_loop!(world, fel, configs, clock, rng; t_end=30.0)
+
+            @test world.zone_stats[2].total_arrivals == 2
+            @test world.zone_stats[2].total_departures == 2
+            @test world.stats.blocked_count == 0
+            @test get_des_agent(world, conveyor_entity) === nothing
+            @test !haskey(world.entity_kinematics, conveyor_entity)
+        end
+    end
+
+    @testset "Blocked conveyor keeps products apart and stationary" begin
+        # (mode, gap, arrival times, expected resting distances front-to-back on a 4 m belt)
+        cases = (
+            (:free_flow,    0.0,  (0.0, 1.0, 2.0), (4.0, 3.0, 2.0)),
+            (:accumulating, 0.25, (0.0, 1.0, 2.0), (4.0, 3.25, 2.5)),
+            (:accumulating, 0.0,  (0.0, 1.0, 2.0), (4.0, 3.5, 3.0)),
+            (:indexing,     0.5,  (0.0, 1.1, 2.2), (4.0, 3.0, 2.0)),
+        )
+        for (mode, gap, arrivals, expected) in cases
+            function run_case(t_end)
+                world = SimWorld()
+                fel = FutureEventList()
+                conveyor = ZoneConfig(
+                    id=1, num_servers=5, capacity=5,
+                    service_dist=deterministic_service(4.0),
+                    routing=FixedRoute(2),
+                    conveyor_mode=mode, conveyor_pitch=0.5, conveyor_gap=gap,
+                    conveyor_index_interval=1.0,
+                    path_length=4.0, nominal_speed=1.0, is_conveyor=true
+                )
+                server = ZoneConfig(id=2, num_servers=1, capacity=1,
+                                    service_dist=deterministic_service(20.0), routing=ExitSystem())
+                configs = Dict(1 => conveyor, 2 => server)
+                build_world!(world, conveyor, server)
+                schedule!(fel, EntityArrival(new_entity_id!(world), 2, 0.0), 0.0)
+                ids = [new_entity_id!(world) for _ in arrivals]
+                for (id, ta) in zip(ids, arrivals)
+                    schedule!(fel, EntityArrival(id, 1, ta), ta)
+                end
+                sim_loop!(world, fel, configs, SimClock(Inf), MersenneTwister(900); t_end=t_end)
+                return world, ids
+            end
+
+            world, ids = run_case(10.0)
+            dists = [SimCore.kinematics_distance(world.entity_kinematics[id], 10.0) for id in ids]
+            speeds = [world.entity_kinematics[id].current_speed for id in ids]
+            @test dists ≈ collect(expected) atol=1e-6
+            @test all(==(0.0), speeds)
+            @test world.stats.blocked_count == 0
+
+            world, _ = run_case(200.0)
+            @test world.zone_stats[2].total_arrivals == 4
+            @test world.zone_stats[2].total_departures == 4
+            @test isempty(world.entity_kinematics)
+            @test world.stats.blocked_count == 0
+        end
+    end
+
+    @testset "Conveyor inlet defers a product that would overlap the one ahead" begin
+        world = SimWorld()
+        fel = FutureEventList()
+        conveyor = ZoneConfig(
+            id=1, num_servers=5, capacity=5, service_dist=deterministic_service(4.0),
+            routing=ExitSystem(), conveyor_mode=:accumulating, conveyor_pitch=0.5, conveyor_gap=0.25,
+            path_length=4.0, nominal_speed=1.0, is_conveyor=true)
+        build_world!(world, conveyor)
+        ids = [new_entity_id!(world) for _ in 1:2]
+        schedule!(fel, EntityArrival(ids[1], 1, 0.0), 0.0)
+        schedule!(fel, EntityArrival(ids[2], 1, 0.1), 0.1)
+        sim_loop!(world, fel, Dict(1 => conveyor), SimClock(Inf), MersenneTwister(1); t_end=0.5)
+        @test length(world.entity_kinematics) == 1
+
+        world = SimWorld(); fel = FutureEventList(); build_world!(world, conveyor)
+        ids = [new_entity_id!(world) for _ in 1:2]
+        schedule!(fel, EntityArrival(ids[1], 1, 0.0), 0.0)
+        schedule!(fel, EntityArrival(ids[2], 1, 0.1), 0.1)
+        sim_loop!(world, fel, Dict(1 => conveyor), SimClock(Inf), MersenneTwister(1); t_end=50.0)
+        @test world.zone_stats[1].total_departures == 2
+        @test world.stats.blocked_count == 0
+    end
+
+    @testset "Conveyor outlet with several destinations only uses one that is open" begin
+        mk_routing = Dict(
+            :prob    => () -> ProbRoute([(2, 0.9), (3, 0.1)]),
+            :rr      => () -> RoundRobinRoute([2, 3]),
+            :sq      => () -> ShortestQueueRoute([2, 3]),
+            :dynamic => () -> DynamicPolicyRoute([2, 3], (w, id, ag, c) -> c[1]),
+        )
+        function run_multi(routing, blocker3_service, t_end)
+            world = SimWorld(); fel = FutureEventList()
+            conv = ZoneConfig(id=1, num_servers=2, capacity=2, service_dist=deterministic_service(2.0),
+                              routing=routing, path_length=2.0, nominal_speed=1.0, is_conveyor=true)
+            s2 = ZoneConfig(id=2, num_servers=1, capacity=1, service_dist=deterministic_service(100.0), routing=ExitSystem())
+            s3 = ZoneConfig(id=3, num_servers=2, capacity=2, service_dist=deterministic_service(blocker3_service), routing=ExitSystem())
+            build_world!(world, conv, s2, s3)
+            schedule!(fel, EntityArrival(new_entity_id!(world), 2, 0.0), 0.0)
+            schedule!(fel, EntityArrival(new_entity_id!(world), 3, 0.0), 0.0)
+            schedule!(fel, EntityArrival(new_entity_id!(world), 1, 1.0, 0, false), 1.0)
+            sim_loop!(world, fel, Dict(1 => conv, 2 => s2, 3 => s3), SimClock(Inf), MersenneTwister(3); t_end=t_end)
+            return world
+        end
+
+        for (name, mk) in mk_routing
+            world = run_multi(mk(), 5.0, 12.0)
+            @test world.zone_stats[3].total_arrivals == 2
+            @test world.zone_stats[2].total_arrivals == 1
+            @test world.stats.blocked_count == 0
+        end
+
+        # Every destination full: the product waits on the belt, then goes to whichever frees first.
+        for (name, mk) in mk_routing
+            world = SimWorld(); fel = FutureEventList()
+            conv = ZoneConfig(id=1, num_servers=2, capacity=2, service_dist=deterministic_service(2.0),
+                              routing=mk(), path_length=2.0, nominal_speed=1.0, is_conveyor=true)
+            s2 = ZoneConfig(id=2, num_servers=1, capacity=1, service_dist=deterministic_service(100.0), routing=ExitSystem())
+            s3 = ZoneConfig(id=3, num_servers=1, capacity=1, service_dist=deterministic_service(20.0), routing=ExitSystem())
+            build_world!(world, conv, s2, s3)
+            schedule!(fel, EntityArrival(new_entity_id!(world), 2, 0.0), 0.0)
+            schedule!(fel, EntityArrival(new_entity_id!(world), 3, 0.0), 0.0)
+            schedule!(fel, EntityArrival(new_entity_id!(world), 1, 1.0, 0, false), 1.0)
+            cfgs = Dict(1 => conv, 2 => s2, 3 => s3)
+            sim_loop!(world, fel, cfgs, SimClock(Inf), MersenneTwister(3); t_end=10.0)
+            @test length(world.entity_kinematics) == 3   # two busy servers plus the held product
+            @test world.zone_stats[3].total_arrivals == 1
+            @test world.stats.blocked_count == 0
+        end
+    end
+
+    @testset "Sources and servers feeding a conveyor are held, never dropped" begin
+        function run_feed(feeder, t_end)
+            world = SimWorld(); fel = FutureEventList()
+            conv = ZoneConfig(id=1, num_servers=2, capacity=2, service_dist=deterministic_service(4.0),
+                              routing=FixedRoute(2), path_length=4.0, nominal_speed=1.0, is_conveyor=true)
+            sink = ZoneConfig(id=2, num_servers=1, capacity=1, service_dist=deterministic_service(20.0), routing=ExitSystem())
+            cfgs = Dict(1 => conv, 2 => sink)
+            if feeder === :source
+                build_world!(world, conv, sink)
+                schedule!(fel, EntityArrival(new_entity_id!(world), 2, 0.0), 0.0)
+                for ta in 0.0:1.0:4.0
+                    schedule!(fel, EntityArrival(new_entity_id!(world), 1, ta, 0, true), ta)
+                end
+            else
+                feed = ZoneConfig(id=3, num_servers=1, capacity=10, service_dist=deterministic_service(0.5), routing=FixedRoute(1))
+                cfgs[3] = feed
+                build_world!(world, conv, sink, feed)
+                schedule!(fel, EntityArrival(new_entity_id!(world), 2, 0.0), 0.0)
+                for ta in 0.0:1.0:4.0
+                    schedule!(fel, EntityArrival(new_entity_id!(world), 3, ta, 0, false), ta)
+                end
+            end
+            sim_loop!(world, fel, cfgs, SimClock(Inf), MersenneTwister(5); t_end=t_end)
+            return world
+        end
+
+        for feeder in (:source, :server)
+            world = run_feed(feeder, 15.0)
+            on_belt = count(k -> k.zone_id == 1, values(world.entity_kinematics))
+            @test on_belt == 2                         # belt capacity respected while the sink is busy
+            @test world.stats.blocked_count == 0
+
+            world = run_feed(feeder, 500.0)
+            @test world.zone_stats[2].total_arrivals == 6     # 1 pre-load + 5 fed products, none lost
+            @test world.zone_stats[2].total_departures == 6
+            @test world.stats.blocked_count == 0
+        end
+    end
+
+    @testset "Internal transfers between stations are lossless" begin
+        world = SimWorld(); fel = FutureEventList()
+        a = ZoneConfig(id=1, num_servers=1, capacity=10, service_dist=deterministic_service(1.0), routing=FixedRoute(2))
+        b = ZoneConfig(id=2, num_servers=1, capacity=2, service_dist=deterministic_service(10.0), routing=ExitSystem())
+        build_world!(world, a, b)
+        for ta in (0.0, 0.1, 0.2, 0.3, 0.4)
+            schedule!(fel, EntityArrival(new_entity_id!(world), 1, ta, 0, false), ta)
+        end
+        sim_loop!(world, fel, Dict(1 => a, 2 => b), SimClock(Inf), MersenneTwister(2); t_end=200.0)
+        @test world.zone_stats[2].total_arrivals == 5
+        @test world.zone_stats[2].total_departures == 5
+        @test world.stats.blocked_count == 0
+    end
+
+    @testset "Hook-chosen destinations (route_to!) wait for room instead of dropping products" begin
+        for sender in (:conveyor, :server)
+            world = SimWorld(); fel = FutureEventList()
+            a = sender === :conveyor ?
+                ZoneConfig(id=1, num_servers=5, capacity=5, service_dist=deterministic_service(2.0), routing=ExitSystem(),
+                           path_length=2.0, nominal_speed=1.0, is_conveyor=true) :
+                ZoneConfig(id=1, num_servers=1, capacity=10, service_dist=deterministic_service(1.0), routing=ExitSystem())
+            b = ZoneConfig(id=2, num_servers=1, capacity=1, service_dist=deterministic_service(10.0), routing=ExitSystem())
+            build_world!(world, a, b)
+            for (i, ta) in enumerate((0.0, 0.1, 0.2, 0.3))
+                id = new_entity_id!(world)
+                world.entity_route_overrides[id] = 2
+                schedule!(fel, EntityArrival(id, 1, ta, 0, false), ta)
+            end
+            sim_loop!(world, fel, Dict(1 => a, 2 => b), SimClock(Inf), MersenneTwister(4); t_end=200.0)
+            @test world.zone_stats[2].total_arrivals == 4
+            @test world.zone_stats[2].total_departures == 4
+            @test world.stats.blocked_count == 0
+        end
+    end
+
     # ── TransferOut routing ───────────────────────────────────────────────────
     @testset "TransferOut routes entity to downstream zone" begin
         world   = SimWorld()

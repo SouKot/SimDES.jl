@@ -87,8 +87,17 @@ Return the time of the next event without removing it.
 Returns `Inf` if the FEL is empty.
 """
 function peek_time(fel::FutureEventList)
-    Base.isempty(fel.queue) && return Inf
-    return peek(fel.queue)[2]
+    while !Base.isempty(fel.queue)
+        cev, t = peek(fel.queue)
+        if cev.id in fel.cancelled
+            # A cancelled head must not hide the real next event, or callers step past their horizon.
+            delete!(fel.cancelled, cev.id)
+            dequeue_pair!(fel.queue)
+            continue
+        end
+        return t
+    end
+    return Inf
 end
 
 Base.isempty(fel::FutureEventList) = Base.isempty(fel.queue)

@@ -397,6 +397,8 @@ struct ZoneConfig
     process_mode            :: Symbol                # :standard, :custom
     path_length             :: Float64
     nominal_speed           :: Float64
+    is_conveyor             :: Bool
+    conveyor_gap            :: Float64               # clear gap between products [m] (accumulating/indexing)
 end
 
 # Backward-compatible 11-argument positional constructor
@@ -406,7 +408,7 @@ ZoneConfig(id::Int, num_servers::Int, capacity::Int, service_dist::ServiceDist,
            failures::FailureModel, fork_join::Union{Nothing, ForkJoinConfig}) =
     ZoneConfig(id, num_servers, capacity, service_dist, arrival, lookahead, downstream,
                routing, queue_discipline, failures, fork_join,
-               nothing, :slot_order, :free_flow, 0.5, 1.0, :standard, 5.0, 1.5)
+               nothing, :slot_order, :free_flow, 0.5, 1.0, :standard, 5.0, 1.5, false, 0.0)
 
 function ZoneConfig(;
         id::Int,
@@ -434,13 +436,16 @@ function ZoneConfig(;
         conveyor_index_interval::Real = 1.0,
         process_mode::Symbol    = :standard,
         path_length::Real       = 5.0,
-        nominal_speed::Real     = 1.5)
+        nominal_speed::Real     = 1.5,
+        is_conveyor::Bool       = false,
+        conveyor_gap::Real      = 0.0)
 
     num_servers > 0     || throw(ArgumentError("num_servers must be ≥ 1"))
     capacity > 0        || throw(ArgumentError("capacity must be ≥ 1"))
     arrival_rate >= 0.0 || throw(ArgumentError("arrival_rate must be ≥ 0"))
     failure_rate >= 0.0 || throw(ArgumentError("failure_rate must be ≥ 0"))
     repair_rate > 0.0   || throw(ArgumentError("repair_rate must be > 0"))
+    conveyor_gap >= 0   || throw(ArgumentError("conveyor_gap must be ≥ 0"))
 
     disc = queue_discipline isa Symbol ?
                _discipline_from_symbol(queue_discipline) :
@@ -450,7 +455,8 @@ function ZoneConfig(;
                lookahead, downstream, routing, disc, failures, fork_join,
                custom_discipline, intake_mode, conveyor_mode,
                Float64(conveyor_pitch), Float64(conveyor_index_interval),
-               process_mode, Float64(path_length), Float64(nominal_speed))
+               process_mode, Float64(path_length), Float64(nominal_speed), is_conveyor,
+               Float64(conveyor_gap))
 end
 
 """
@@ -467,10 +473,12 @@ function build_world!(world::SimWorld, configs::ZoneConfig...)
                   num_servers = cfg.num_servers)
         # Register per-zone stats for multi-zone scenarios
         world.zone_stats[cfg.id] = SimStats()
-        if cfg.conveyor_mode != :free_flow || cfg.intake_mode != :slot_order ||
+        if cfg.is_conveyor || cfg.conveyor_mode != :free_flow || cfg.intake_mode != :slot_order ||
            cfg.process_mode != :standard || cfg.path_length != 5.0 || cfg.nominal_speed != 1.5
+            SimCore.set_zone_attribute!(world, cfg.id, "_is_conveyor", cfg.is_conveyor)
             SimCore.set_zone_attribute!(world, cfg.id, "_conveyor_mode", cfg.conveyor_mode)
             SimCore.set_zone_attribute!(world, cfg.id, "_conveyor_pitch", cfg.conveyor_pitch)
+            SimCore.set_zone_attribute!(world, cfg.id, "_conveyor_gap", cfg.conveyor_gap)
             SimCore.set_zone_attribute!(world, cfg.id, "_conveyor_index_interval", cfg.conveyor_index_interval)
             SimCore.set_zone_attribute!(world, cfg.id, "_process_mode", cfg.process_mode)
             SimCore.set_zone_attribute!(world, cfg.id, "_path_length", cfg.path_length)
