@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Custom Entity Design Diagrams</title>
+<style>
+*{box-sizing:border-box}body{margin:0;padding:35px;background:#f0f3f5;color:#172c37;font-family:"DejaVu Sans",sans-serif;letter-spacing:0}h1{font-size:30px;margin:0 0 12px}p{font-size:15px;line-height:1.7;margin:0 0 22px;color:#526674}.figure{display:none}.figure.active{display:block}.band{padding:20px 22px;background:white;border:1px solid #c8d3db;margin-bottom:15px}.band h2{font-size:17px;margin:0 0 15px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}.col{padding-left:16px;border-left:4px solid #238d79}.col.blue{border-color:#377bad}.col.gold{border-color:#b6831a}h3{font-size:15px;margin:0 0 10px}ul{padding-left:18px;margin:0;line-height:1.9;font-size:14px}code{font-family:"DejaVu Sans Mono",monospace;font-size:13px}.flow{display:flex;align-items:center;gap:10px;margin:16px 0}.step{flex:1;min-width:0;padding:17px 14px;background:#fff;border:1px solid #a8bfc9;border-top:4px solid #238d79;min-height:128px}.step b{display:block;font-size:16px;margin-bottom:12px}.step span{font-size:13px;line-height:1.7;color:#526674}.arrow{color:#377bad;font-size:25px}.down{text-align:center;font-size:16px;color:#377bad;margin:9px 0}.kernel{background:#172c37;color:white;border:0}.kernel p{color:#c3d7df;margin:8px 0 0;font-size:14px}.note{font-size:13px;color:#526674;line-height:1.8;margin-top:15px}.lane{display:grid;grid-template-columns:170px 1fr;gap:15px;padding:16px 0;border-bottom:1px solid #d2dbe0;font-size:14px;line-height:1.7}.lane b{color:#238d79}.tags{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px}.tag{padding:8px 12px;background:#e4edf3;font-size:13px}.waiting{border-left:5px solid #b6831a;background:#fff8e8}.waiting p{margin:0;color:#5c4b28}.strip{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;padding:16px 0;font-size:14px;line-height:1.8}
+</style>
+</head>
+<body>
+<section id="architecture" class="figure">
+<h1>A Custom Entity: Mechanics + Decisions + Extension Points</h1>
+<p>Proposed architecture. Component implementations and helpers are supplied by the framework; event handlers define the entity's algorithm.</p>
+<div class="band"><h2>Entity definition copied as one versioned bundle</h2><div class="grid">
+<div class="col"><h3>Components: reusable mechanics</h3><ul><li>Storage and capacity</li><li>Processing slots / resources</li><li>Transport track or cargo</li><li>Validated operations and metrics</li></ul></div>
+<div class="col blue"><h3>Behavior: algorithm and state</h3><ul><li>Typed state and parameters</li><li>Arrival / start / completion</li><li>Transfer attempts / departure</li><li>Named timers and typed messages</li></ul></div>
+<div class="col gold"><h3>Hooks: explicit extension points</h3><ul><li>Declared by the behavior</li><li>Called at visible code locations</li><li>Optional recipe or user function</li><li>No duplicate event algorithm</li></ul></div>
+</div></div>
+<div class="down">Components expose helpers; behavior uses them and calls its declared hooks</div>
+<div class="band"><h2>Example: one completed operation</h2><div class="flow">
+<div class="step"><b>Complete once</b><span>Record work outcome<br><code>on_complete</code></span></div><div class="arrow">→</div>
+<div class="step"><b>Request transfer</b><span>Choose destination<br><code>hook_before_transfer</code></span></div><div class="arrow">→</div>
+<div class="step"><b>Kernel checks</b><span>Acceptance and ownership<br>Wait if destination is full</span></div><div class="arrow">→</div>
+<div class="step"><b>Commit / depart</b><span>Ownership changes once<br><code>hook_after_departure</code></span></div>
+</div></div>
+<div class="band kernel"><h2>Native kernel: the protected foundation</h2><p>Future-event list · atomic acceptance / transfers · item ownership · resource accounting · cancellation / generations · statistics</p></div>
+<div class="strip"><div><b>Behavior tab</b><br>Components, state, full event code and declared timer/message types.</div><div><b>Hooks tab</b><br>Only declared hook points, with navigation to their call sites.</div><div><b>Existing panels</b><br>Process parameters, ports, geometry and charts remain in their familiar locations.</div></div>
+<div class="note">No new universal lifecycle event is needed for an inspection result: handle a typed message in <code>on_message</code>.<br>Statecharts and process-flow editors are possible later authoring tools, not part of the Server-first milestone.</div>
+</section>
+<section id="transporter" class="figure">
+<h1>Worked Example: Transporter Picks Up and Delivers a Stack</h1>
+<p>Domain activities reuse timers, messages and processing operations. A moving product must always have an owner.</p>
+<div class="flow">
+<div class="step"><b>1. Idle / task</b><span>Task message names pickup,<br>destination and load</span></div><div class="arrow">→</div>
+<div class="step"><b>2. Travel to pickup</b><span>Movement component<br>Timed route completion</span></div><div class="arrow">→</div>
+<div class="step"><b>3. Load</b><span>Validated cargo admission<br>Timed loading operation</span></div><div class="arrow">→</div>
+<div class="step"><b>4. Travel loaded</b><span>Transporter owns cargo<br>Track position and route</span></div><div class="arrow">→</div>
+<div class="step"><b>5. Unload / finish</b><span>Timed unload + acceptance<br>Commit delivery, report task</span></div>
+</div>
+<div class="band waiting"><h2>Destination full? Keep the load; do not repeat completed travel or work.</h2><p>Unload request → blocked → destination readiness wake-up → retry transfer → successful delivery.<br>Reserve receiving space before unloading when physical unloading cannot finish without it. The transporter stays unavailable for another incompatible task.</p></div>
+<div class="band"><h2>Which existing handlers implement this?</h2>
+<div class="lane"><b>on_message</b><span>Receive <code>transport_task</code> and domain responses. Queue or refuse a task using an explicit policy.</span></div>
+<div class="lane"><b>on_timer</b><span>Handle named movement completions such as <code>pickup_reached</code> and <code>destination_reached</code>. They are not extra universal lifecycle stages.</span></div>
+<div class="lane"><b>on_start / complete</b><span>Perform loading or unloading operations. Record operation outcomes once, even when the following handoff waits.</span></div>
+<div class="lane"><b>Transfer lifecycle</b><span>Check final admission, hold cargo while blocked, and commit ownership changes once. Departure notifications belong to the source owner of each handoff.</span></div>
+<div class="lane"><b>Optional failure logic</b><span>Interrupt travel/work, invalidate old deadlines and apply a declared resume or restart policy.</span></div>
+</div>
+<div class="tags"><span class="tag">Movement / route</span><span class="tag">Cargo storage</span><span class="tag">Timed operations</span><span class="tag">Task state</span><span class="tag">Optional driver / dock / battery</span></div>
+<div class="note"><b>Stack policy:</b> transfer one grouped load atomically, or transfer members individually with explicit partial-load rules. Do not leave this implicit.<br><b>Scope:</b> fixed routes and travel times first; collision avoidance, congestion and detailed vehicle dynamics require later movement components.</div>
+</section>
+<script>
+const figure = document.getElementById(location.hash.slice(1) || 'architecture');
+if (figure) figure.classList.add('active');
+</script>
+</body>
+</html>

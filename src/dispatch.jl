@@ -119,6 +119,10 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
                    sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
     zone = get_zone(world, e.zone_id)
     cfg  = configs[e.zone_id]
+    pending = SimCore.get_zone_attribute(world, e.zone_id, "_pending_arrivals", nothing)
+    reserved = pending !== nothing && e.entity_id in pending
+    reserved && delete!(pending, e.entity_id)
+    pending_count = pending === nothing ? 0 : length(pending)
 
     # ── Time-average stats for interval since last event
     _update_time_averages!(world, zone, e.zone_id, t; pipeline=pipeline)
@@ -127,7 +131,8 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     #    an arrival that cannot enter waits with its feeder, and a source stays stalled meanwhile.
     if _is_conveyor_zone(world, e.zone_id, cfg)
         inlet_wait = _inlet_clear_delay(world, e.zone_id, cfg, t)
-        if zone.queue_length + zone.busy_servers >= cfg.capacity || inlet_wait > 0.0
+          if zone.queue_length + zone.busy_servers + pending_count >= cfg.capacity || inlet_wait > 0.0 ||
+              (!reserved && pending_count > 0)
             _hold_at_feeder!(world, e, t)
             _wake_feeder!(world, fel, e.zone_id, cfg, t)
             return
@@ -149,7 +154,7 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     end
 
     # ── Check finite buffer (M/M/1/K blocking)
-    entities_in_system = zone.queue_length + zone.busy_servers
+    entities_in_system = zone.queue_length + zone.busy_servers + pending_count
     if entities_in_system >= cfg.capacity
         # Entity rejected — buffer full
         record_blocked!(world.stats)
@@ -226,6 +231,8 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     # ── Schedule next arrival from this zone's Poisson/NHPP process.
     e.is_external && _schedule_next_arrival!(world, fel, configs, rng, e.zone_id, cfg, t)
     _is_conveyor_zone(world, e.zone_id, cfg) && _wake_feeder!(world, fel, e.zone_id, cfg, t)
+    reserved && _is_conveyor_zone(world, e.zone_id, cfg) &&
+        _release_upstream!(world, fel, configs, e.zone_id, t)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -547,8 +554,7 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
             return :exit
         else
             _record_routed_wait!(world, wait_time)
-            world.des_agents[entity_id] = DESAgent(t, dest_override, agent.priority, Inf)
-            schedule!(fel, EntityArrival(entity_id, dest_override, t, agent.priority, false), t)
+            _schedule_routed_arrival!(world, fel, entity_id, dest_override, agent.priority, t)
             return :routed
         end
     end
@@ -561,9 +567,8 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
         dest = routing.to
         _record_routed_wait!(world, wait_time)
         # Keep entity in world; update current_zone for DESAgent
-        world.des_agents[entity_id] = DESAgent(t, dest, agent.priority, Inf)
+        _schedule_routed_arrival!(world, fel, entity_id, dest, agent.priority, t)
         # Routed arrival: is_external=false — does NOT trigger next external arrival at dest
-        schedule!(fel, EntityArrival(entity_id, dest, t, agent.priority, false), t)
         return :routed
 
     elseif routing isa ProbRoute
@@ -573,9 +578,8 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
             return :exit
         else
             _record_routed_wait!(world, wait_time)
-            world.des_agents[entity_id] = DESAgent(t, dest, agent.priority, Inf)
+            _schedule_routed_arrival!(world, fel, entity_id, dest, agent.priority, t)
             # Routed arrival: is_external=false — does NOT trigger next external arrival at dest
-            schedule!(fel, EntityArrival(entity_id, dest, t, agent.priority, false), t)
             return :routed
         end
 
@@ -599,8 +603,7 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
             end
         end
         _record_routed_wait!(world, wait_time)
-        world.des_agents[entity_id] = DESAgent(t, best_dest, agent.priority, Inf)
-        schedule!(fel, EntityArrival(entity_id, best_dest, t, agent.priority, false), t)
+        _schedule_routed_arrival!(world, fel, entity_id, best_dest, agent.priority, t)
         return :routed
 
     elseif routing isa RoundRobinRoute
@@ -613,8 +616,7 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
         routing.cursor = idx
         dest = cands[idx]
         _record_routed_wait!(world, wait_time)
-        world.des_agents[entity_id] = DESAgent(t, dest, agent.priority, Inf)
-        schedule!(fel, EntityArrival(entity_id, dest, t, agent.priority, false), t)
+        _schedule_routed_arrival!(world, fel, entity_id, dest, agent.priority, t)
         return :routed
 
     elseif routing isa DynamicPolicyRoute
@@ -629,11 +631,23 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
             return :exit
         end
         _record_routed_wait!(world, wait_time)
-        world.des_agents[entity_id] = DESAgent(t, dest, agent.priority, Inf)
-        schedule!(fel, EntityArrival(entity_id, dest, t, agent.priority, false), t)
+        _schedule_routed_arrival!(world, fel, entity_id, dest, agent.priority, t)
         return :routed
     end
     return :unknown
+end
+
+function _schedule_routed_arrival!(world::SimWorld, fel::FutureEventList,
+                                   entity_id::UInt64, dest::Int, priority::Int, t::Float64)
+    pending = SimCore.get_zone_attribute(world, dest, "_pending_arrivals", nothing)
+    if pending === nothing
+        pending = Set{UInt64}()
+        SimCore.set_zone_attribute!(world, dest, "_pending_arrivals", pending)
+    end
+    push!(pending, entity_id)
+    world.des_agents[entity_id] = DESAgent(t, dest, priority, Inf)
+    schedule!(fel, EntityArrival(entity_id, dest, t, priority, false), t)
+    return nothing
 end
 
 """
@@ -957,10 +971,13 @@ function _dest_wait(world::SimWorld, configs::Dict{Int, ZoneConfig}, dest_id::In
     dz = world.zone_states[dest_id]
     dcfg = get(configs, dest_id, nothing)
     cap = dcfg !== nothing ? min(dz.capacity, dcfg.capacity) : dz.capacity
+    pending = SimCore.get_zone_attribute(world, dest_id, "_pending_arrivals", nothing)
+    pending_count = pending === nothing ? 0 : length(pending)
     # A failed server takes its slot out of service.
     failed = dcfg !== nothing ? max(0, dcfg.num_servers - dz.num_servers) : 0
-    (dz.queue_length + dz.busy_servers) >= cap - failed && return Inf
+    (dz.queue_length + dz.busy_servers + pending_count) >= cap - failed && return Inf
     if dcfg !== nothing && _is_conveyor_zone(world, dest_id, dcfg)
+        pending_count > 0 && return Inf
         return _inlet_clear_delay(world, dest_id, dcfg, t)
     end
     return 0.0
@@ -1092,7 +1109,10 @@ function _wake_feeder!(world::SimWorld, fel::FutureEventList, zone_id::Int, cfg:
     held = SimCore.get_zone_attribute(world, zone_id, "_feeder_wait", nothing)
     (held === nothing || isempty(held)) && return nothing
     zone = world.zone_states[zone_id]
-    zone.queue_length + zone.busy_servers >= cfg.capacity && return nothing
+    pending = SimCore.get_zone_attribute(world, zone_id, "_pending_arrivals", nothing)
+    pending_count = pending === nothing ? 0 : length(pending)
+    zone.queue_length + zone.busy_servers + pending_count >= cfg.capacity && return nothing
+    pending_count > 0 && return nothing
     w = _inlet_clear_delay(world, zone_id, cfg, t)
     isfinite(w) || return nothing
     due = t + w
@@ -1305,6 +1325,9 @@ function _try_pull_from_upstream_queues!(
     t::Float64
 )
     zone.busy_servers >= zone.num_servers && return nothing
+    pending = SimCore.get_zone_attribute(world, station_id, "_pending_arrivals", nothing)
+    pending_count = pending === nothing ? 0 : length(pending)
+    zone.queue_length + zone.busy_servers + pending_count >= cfg.capacity && return nothing
     # A belt is fed only through its inlet; pulling from a queue would skip admission and carry no position.
     _is_conveyor_zone(world, station_id, cfg) && return nothing
     pd = world.port_directory

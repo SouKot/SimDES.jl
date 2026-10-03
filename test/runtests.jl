@@ -606,6 +606,53 @@ end
         end
     end
 
+    @testset "Same-time senders reserve one shared destination slot" begin
+        world = SimWorld()
+        fel = FutureEventList()
+        first = ZoneConfig(id=1, capacity=1, service_dist=deterministic_service(1.0), routing=FixedRoute(3))
+        second = ZoneConfig(id=2, capacity=1, service_dist=deterministic_service(1.0), routing=FixedRoute(3))
+        destination = ZoneConfig(id=3, capacity=1, service_dist=deterministic_service(10.0))
+        configs = Dict(1 => first, 2 => second, 3 => destination)
+        build_world!(world, first, second, destination)
+        for zone_id in (1, 2)
+            schedule!(fel, EntityArrival(new_entity_id!(world), zone_id, 0.0, 0, false), 0.0)
+        end
+        rng = MersenneTwister(2024)
+        claims_observed = false
+        while isfinite(peek_time(fel))
+            event, time = safe_dequeue!(fel)
+            world.time = time
+            dispatch!(world, fel, configs, rng, event.inner, time)
+            pending = SimCore.get_zone_attribute(world, 3, "_pending_arrivals", Set{UInt64}())
+            claims_observed |= !isempty(pending)
+            zone = world.zone_states[3]
+            @test zone.queue_length + zone.busy_servers + length(pending) <= 1
+        end
+        @test claims_observed
+        @test world.zone_stats[3].total_departures == 2
+        @test world.stats.blocked_count == 0
+        @test isempty(world.des_agents)
+        @test isempty(SimCore.get_zone_attribute(world, 3, "_pending_arrivals", Set{UInt64}()))
+    end
+
+    @testset "External arrivals cannot steal reserved internal capacity" begin
+        world = SimWorld()
+        fel = FutureEventList()
+        destination = ZoneConfig(id=1, capacity=1, service_dist=deterministic_service(1.0))
+        build_world!(world, destination)
+        reserved_item = new_entity_id!(world)
+        SimDES._schedule_routed_arrival!(world, fel, reserved_item, 1, 0, 0.0)
+        external_item = new_entity_id!(world)
+        rng = MersenneTwister(2024)
+        dispatch!(world, fel, Dict(1 => destination), rng,
+            EntityArrival(external_item, 1, 0.0), 0.0)
+        @test world.stats.blocked_count == 1
+        sim_loop!(world, fel, Dict(1 => destination), SimClock(Inf), rng)
+        @test world.zone_stats[1].total_arrivals == 1
+        @test world.zone_stats[1].total_departures == 1
+        @test isempty(world.des_agents)
+    end
+
     @testset "Internal transfers between stations are lossless" begin
         world = SimWorld(); fel = FutureEventList()
         a = ZoneConfig(id=1, num_servers=1, capacity=10, service_dist=deterministic_service(1.0), routing=FixedRoute(2))
