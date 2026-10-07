@@ -57,7 +57,7 @@ This codebase was developed with the assistance of **Google DeepMind Antigravity
 
 ## Runnable Verification Examples
 
-`SimDES.jl` ships with 5 standalone, executable examples in its `examples/` directory:
+`SimDES.jl` ships with 6 standalone, executable examples in its `examples/` directory:
 
 | Script | Theoretical / Algorithmic Scope |
 | :--- | :--- |
@@ -66,10 +66,12 @@ This codebase was developed with the assistance of **Google DeepMind Antigravity
 | `03_conveyor_accumulation.jl` | Zero-Pressure Accumulation (ZPA) physical line under bottleneck. |
 | `04_nhpp_call_center.jl` | Time-varying Poisson demand via Lewis-Shedler thinning. |
 | `05_makie_visualization.jl` | Makie recipes, live Observable animation, and schedule timelines. |
+| `06_interactive_conveyor_makie.jl` | Interactive GLMakie GUI with animated conveyor, obstruction gate, and ZPA/rigid modes. |
 
 ### Running from the Terminal
 ```bash
 julia --project=. examples/01_mm1_analytical_audit.jl
+julia --project=. examples/06_interactive_conveyor_makie.jl
 ```
 
 ### Running from the Julia REPL
@@ -77,6 +79,7 @@ julia --project=. examples/01_mm1_analytical_audit.jl
 using Pkg; Pkg.activate(".")
 include("examples/01_mm1_analytical_audit.jl")
 include("examples/05_makie_visualization.jl")
+include("examples/06_interactive_conveyor_makie.jl")
 ```
 
 ---

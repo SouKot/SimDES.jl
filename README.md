@@ -105,7 +105,7 @@ println("Mean System Wait W:  ", stats.mean_sojourn) # Expected ≈ 0.50
 
 ## 6. Running Examples & Interactive Runtime Inspection
 
-`SimDES.jl` provides 5 runnable example scripts in the [`examples/`](examples/) directory covering analytical benchmarks, accumulation kinematics, and live visualization:
+`SimDES.jl` provides 6 runnable example scripts in the [`examples/`](examples/) directory covering analytical benchmarks, accumulation kinematics, and live visualization:
 
 | Script | Mathematical / Physical Focus |
 | :--- | :--- |
@@ -114,12 +114,14 @@ println("Mean System Wait W:  ", stats.mean_sojourn) # Expected ≈ 0.50
 | [`03_conveyor_accumulation.jl`](examples/03_conveyor_accumulation.jl) | Zero-Pressure Accumulation (ZPA) physical conveyor with zero collisions under bottleneck. |
 | [`04_nhpp_call_center.jl`](examples/04_nhpp_call_center.jl) | Time-varying arrival demand via Lewis–Shedler rejection thinning. |
 | [`05_makie_visualization.jl`](examples/05_makie_visualization.jl) | 2D flow schematic (`simplot`), queue step-chart, server Gantt timeline, and trajectory animation. |
+| [`06_interactive_conveyor_makie.jl`](examples/06_interactive_conveyor_makie.jl) | Interactive GLMakie GUI with animated conveyor, obstruction gate, toggle between ZPA and rigid modes, and live HUD. |
 
 ### Running from the Command Line
 ```bash
 # Activate the package environment and run any example
 julia --project=. examples/01_mm1_analytical_audit.jl
 julia --project=. examples/05_makie_visualization.jl
+julia --project=. examples/06_interactive_conveyor_makie.jl
 ```
 
 ### Running from the Julia REPL
