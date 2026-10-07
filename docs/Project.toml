@@ -1,7 +1,11 @@
 [deps]
-Documenter = "e30172f5-a6a5-577e-9721-9677383e9142"
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 SimCore = "0c356fe6-1c88-4cf8-b16c-a521627c3420"
 SimDES = "4b36ed4b-0aee-48cb-8514-e2c6d0980b55"
+
+[sources]
+SimCore = {path = "/run/media/sourabh/SANDISK-2TB/antigravity/ABM/packages/SimCore"}
+SimDES = {path = "/run/media/sourabh/SANDISK-2TB/antigravity/ABM/packages/SimDES"}
 
 [compat]
 Documenter = "1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8"

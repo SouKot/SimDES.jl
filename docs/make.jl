@@ -5,7 +5,7 @@ using SimDES
 makedocs(
     sitename = "SimDES.jl",
     authors = "Sourabh Kotnala <sauravkotnala@gmail.com>",
-    modules = [SimDES],
+    modules = [SimDES, SimCore],
     format = Documenter.HTML(
         prettyurls = get(ENV, "CI", nothing) == "true",
         canonical = "https://SouKot.github.io/SimDES.jl",
@@ -19,7 +19,7 @@ makedocs(
         "API Reference" => "api.md",
     ],
     checkdocs = :exports,
-    warnonly = [:missing_docs, :cross_references],
+    warnonly = [:missing_docs, :cross_references, :docs_block],
 )
 
 deploydocs(

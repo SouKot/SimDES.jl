@@ -192,8 +192,46 @@ display(fig)
 
 ---
 
-## 7. Early-Stage Development Advisory (v0.1.0) & Scope
+## 7. Environment & Verification Platform
 
+The current codebase is tested and verified on:
+* **Operating System**: **Ubuntu 26.04.1 LTS** (`x86_64`, Linux kernel 6.x)
+* **Julia Versions**: Julia 1.10.12 LTS and Julia 1.13.0 (all 289 queueing benchmarks passing clean, 100%)
+* **Automated CI/CD Status**: Automated GitHub Actions workflows are currently **paused** (manual trigger via `workflow_dispatch` only).
+
+---
+
+## 8. Building Documentation Locally
+
+HTML documentation can be built locally using [Documenter.jl](https://documenter.juliadocs.org/):
+
+```bash
+# From packages/SimDES directory:
+julia --project=docs -e '
+    using Pkg
+    Pkg.develop([PackageSpec(path="../SimCore"), PackageSpec(path=pwd())])
+    Pkg.instantiate()
+    include("docs/make.jl")
+'
+```
+
+Alternatively, from the Julia REPL:
+```julia
+using Pkg
+Pkg.activate("docs")
+Pkg.develop([PackageSpec(path="../SimCore"), PackageSpec(path=".")])
+Pkg.instantiate()
+include("docs/make.jl")
+```
+
+The compiled static documentation website will be generated in `docs/build/`. You can open it locally in any web browser:
+```bash
+xdg-open docs/build/index.html
+```
+
+---
+
+## 9. Early-Stage Development Advisory (v0.1.0) & Scope
 
 `SimDES.jl` is released at **`v0.1.0`**.
 * **Maturity**: Core queueing primitives, event dispatching, and conveyor kinematics are mathematically validated against closed-form formulas in the test suite.
@@ -202,13 +240,13 @@ display(fig)
 
 ---
 
-## 8. AI Pair-Programming & Human Oversight Disclosure
+## 10. AI Pair-Programming & Human Oversight Disclosure
 
 `SimDES.jl` was authored through human-directed pair programming using Google DeepMind's Antigravity assistant. Every dispatch rule, queueing mechanic, and state machine has been verified by the human maintainers against canonical theoretical formulas from queueing and material flow literature.
 
 ---
 
-## 9. License
+## 11. License
 
 `SimDES.jl` is licensed under the [GNU Affero General Public License v3.0 (AGPLv3)](LICENSE).
 

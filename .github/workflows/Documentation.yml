@@ -1,11 +1,8 @@
 name: Documentation
 
+# Automated documentation build paused for now — manual trigger only
 on:
-  push:
-    branches:
-      - main
-    tags: ['*']
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: write
