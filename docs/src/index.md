@@ -6,6 +6,14 @@
 [![Version](https://juliahub.com/docs/packages/SimDES/version.svg)](https://juliahub.com/ui/Packages/SimDES/0.1.0)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
+```@raw html
+<p align="center">
+  <img src="assets/conveyor_simulation.gif" alt="SimDES Interactive Conveyor Simulation" width="850">
+  <br>
+  <em>Physical conveyor kinematics with GLMakie: Optical safety interlock gating, Zero-Pressure Accumulation (ZPA) queuing without item volume destruction, and smooth flow resumption.</em>
+</p>
+```
+
 ---
 
 ## Overview
@@ -34,11 +42,18 @@ Every component in `SimDES.jl` is grounded in closed-form numerical mathematics 
 
 ---
 
-## Installation
+## Installation & Dependencies
+
+`SimDES.jl` **depends directly on `SimCore.jl`** for foundational simulation primitives (`SimWorld`, `FutureEventList`, event stepping, entity kinematics, and state management):
 
 ```julia
 using Pkg
-Pkg.add("SimDES")
+Pkg.add(["SimCore", "SimDES"])
+```
+
+For interactive Makie visualizations or publication plotting, install a Makie backend (e.g. `GLMakie` or `CairoMakie`):
+```julia
+Pkg.add("GLMakie") # or Pkg.add("CairoMakie")
 ```
 
 ---

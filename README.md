@@ -7,6 +7,35 @@
 
 **A discrete-event simulation engine in Julia for queueing networks, material handling, and manufacturing systems, rigorously verified against closed-form analytical queueing theory.**
 
+<p align="center">
+  <img src="docs/src/assets/conveyor_simulation.gif" alt="SimDES Interactive Conveyor Simulation" width="850">
+  <br>
+  <em>Live material handling simulation using <code>SimDES.jl</code> and <code>GLMakie</code> (Example 6): Demonstrates physical conveyor transport, optical safety interlock gating (amber LED), Zero-Pressure Accumulation (ZPA) queuing without item volume destruction, and smooth flow resumption.</em>
+</p>
+
+---
+
+## Installation & Dependencies
+
+`SimDES.jl` is part of the Hermes open-core ecosystem and **depends directly on [`SimCore.jl`](https://github.com/SouKot/SimCore.jl)** for foundational simulation primitives (`SimWorld`, `FutureEventList`, event stepping, entity kinematics, and state management).
+
+To install both packages in your Julia environment:
+
+```julia
+using Pkg
+Pkg.add(["SimCore", "SimDES"])
+```
+
+Or from the Julia package manager REPL (press `]`):
+```julia-pkg
+pkg> add SimCore SimDES
+```
+
+> **Visualization Backends**: `SimDES.jl` core has zero graphics overhead. For interactive desktop GUIs or publication figures, load a Makie backend (e.g., `GLMakie` or `CairoMakie`), which automatically triggers the `SimDESMakieExt` extension:
+> ```julia
+> Pkg.add("GLMakie") # or Pkg.add("CairoMakie")
+> ```
+
 ---
 
 ## 1. Problem Statement & Architecture
@@ -118,10 +147,11 @@ println("Mean System Wait W:  ", stats.mean_sojourn) # Expected ≈ 0.50
 
 ### Running from the Command Line
 ```bash
-# Activate the package environment and run any example
-julia --project=. examples/01_mm1_analytical_audit.jl
-julia --project=. examples/05_makie_visualization.jl
+# Run interactive conveyor GUI with GLMakie
 julia --project=. examples/06_interactive_conveyor_makie.jl
+
+# Generate animated demonstration GIF
+julia --project=. examples/06_interactive_conveyor_makie.jl --gif
 ```
 
 ### Running from the Julia REPL

@@ -44,7 +44,7 @@ mutable struct ConveyorItem
     is_stopped::Bool
 end
 
-function run_interactive_conveyor()
+function run_interactive_conveyor(; return_controls::Bool = false)
     # Physical Belt Parameters
     belt_length   = 10.0   # meters
     nominal_speed = 1.5    # meters/second
@@ -371,11 +371,58 @@ function run_interactive_conveyor()
         items_count_str[] = string(length(items))
     end
 
-    # Return figure and stepper function
-    return fig, sim_step!
+    # Return figure and stepper function (optionally with interactive controls)
+    if return_controls
+        return fig, sim_step!, btn_block, tog_mode
+    else
+        return fig, sim_step!
+    end
 end
 
-# ── Launch Interactive Window or Save Headless Demonstration ─────────────────
+"""
+    record_conveyor_gif(output_path = "packages/SimDES/docs/src/assets/conveyor_simulation.gif";
+                        n_frames = 150, fps = 20)
+
+Records a complete animated demonstration of the conveyor kinematics to an animated GIF.
+Demonstrates smooth box transport, obstruction gate triggering, optical safety interlock,
+Zero-Pressure Accumulation (ZPA) queuing, and smooth flow resumption upon clearance.
+"""
+function record_conveyor_gif(output_path::String = "packages/SimDES/docs/src/assets/conveyor_simulation.gif";
+                             n_frames::Int = 180, fps::Int = 20)
+    fig, step_fn!, btn_block, _ = run_interactive_conveyor(return_controls = true)
+
+    # Pre-roll 160 frames so items are evenly distributed across the belt
+    for _ in 1:160
+        step_fn!()
+    end
+
+    mkpath(dirname(output_path))
+    println("Recording conveyor simulation GIF (\$n_frames frames @ \$fps fps)...")
+    Makie.record(fig, output_path, 1:n_frames; framerate = fps) do frame
+        # At frame 25: user triggers obstruction gate
+        if frame == 25
+            btn_block.clicks[] += 1
+        end
+
+        # At frame 105: user releases obstruction gate
+        if frame == 105
+            btn_block.clicks[] += 1
+        end
+
+        step_fn!()
+    end
+    println("Saved conveyor demonstration GIF -> \$output_path (\$(round(filesize(output_path)/1024, digits=1)) KB)")
+    return output_path
+end
+
+# ── Launch Interactive Window, GIF Recording, or Save Headless Snapshot ─────
+
+if "--gif" in ARGS
+    gif_target = length(ARGS) > 1 && !startswith(ARGS[2], "--") ?
+        ARGS[2] : "packages/SimDES/docs/src/assets/conveyor_simulation.gif"
+    record_conveyor_gif(gif_target)
+    exit(0)
+end
 
 fig, step_fn! = run_interactive_conveyor()
 
