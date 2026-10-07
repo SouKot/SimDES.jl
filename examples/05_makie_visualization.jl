@@ -81,9 +81,23 @@ providing `simplot()`, `plot_queue_history()`, `plot_gantt()`, and `animate_sim(
                            title = "Multi-Server Workstation State Timeline",
                            resolution = (900, 400))
     Base.invokelatest(Makie.save, "server_gantt_timeline.png", fig_gantt)
-    println("Saved -> server_gantt_timeline.png")
+    # 4. Trajectory Flow Animation (animate_sim with Observables)
+    println("\n[4/4] Demonstrating Observable-Backed Trajectory Flow Animation (`animate_sim`)...")
+    snapshots = [
+        (t = 0.0, items = [(x = 0.0, y = 0.0), (x = 2.0, y = 0.0)]),
+        (t = 1.0, items = [(x = 1.0, y = 0.0), (x = 3.0, y = 0.0)]),
+        (t = 2.0, items = [(x = 2.0, y = 0.0), (x = 4.0, y = 0.0)]),
+        (t = 3.0, items = [(x = 3.0, y = 0.0), (x = 5.0, y = 0.0)]),
+        (t = 4.0, items = [(x = 4.0, y = 0.0), (x = 6.0, y = 0.0)]),
+        (t = 5.0, items = [(x = 5.0, y = 0.0), (x = 7.0, y = 0.0)]),
+    ]
+    fig_anim, step_obs = animate_sim(snapshots; resolution = (800, 350))
+    Base.invokelatest(Makie.save, "flow_trajectory_animation.png", fig_anim)
+    println("Saved snapshot -> flow_trajectory_animation.png")
+    println("Interactive runtime usage: in REPL with GLMakie, call `display(fig_anim)` and update `step_obs[] = i`.")
 
     println("\nAll Makie visualization recipes executed and saved successfully!")
 end
+
 
 run_makie_visualization_demo()

@@ -75,3 +75,41 @@ function sim_loop!(world::SimWorld, fel::FutureEventList,
 
     return world.stats
 end
+
+"""
+    step_sim!(world, fel, configs, rng; clock=nothing, pipeline=nothing, sync_bufs=nothing) -> Union{NamedTuple, Nothing}
+
+Execute a single discrete event from the Future Event List (FEL).
+Advances `world.time` to the event's timestamp, applies optional clock throttling,
+and routes the event through Julia's multiple dispatch.
+
+Returns `(event = cev.inner, t = t)` or `nothing` if the FEL is empty.
+
+# Interactive REPL Example
+```julia
+# Advance simulation by exactly one event:
+step_info = step_sim!(world, fel, configs, rng)
+if step_info !== nothing
+    println("Processed \$(typeof(step_info.event)) at simulated t = \$(step_info.t)")
+end
+```
+"""
+function step_sim!(world::SimWorld, fel::FutureEventList,
+                   configs::Dict{Int,ZoneConfig},
+                   rng::AbstractRNG;
+                   clock::Union{Nothing, SimClock} = nothing,
+                   pipeline::Union{Nothing, StatsPipeline} = nothing,
+                   sync_bufs::Union{Nothing, HybridSyncBuffers} = nothing)
+    result = safe_dequeue!(fel)
+    result === nothing && return nothing
+
+    cev, t = result
+    if clock !== nothing
+        throttle!(clock, t)
+    end
+    world.time = t
+
+    dispatch!(world, fel, configs, rng, cev.inner, t; pipeline=pipeline, sync_bufs=sync_bufs)
+    return (event = cev.inner, t = t)
+end
+

@@ -55,7 +55,34 @@ This codebase was developed with the assistance of **Google DeepMind Antigravity
 
 ---
 
+## Runnable Verification Examples
+
+`SimDES.jl` ships with 5 standalone, executable examples in its `examples/` directory:
+
+| Script | Theoretical / Algorithmic Scope |
+| :--- | :--- |
+| `01_mm1_analytical_audit.jl` | $M/M/1$ queue benchmarked against closed-form theory. |
+| `02_jackson_open_network.jl` | 3-station open Jackson network with product-form routing. |
+| `03_conveyor_accumulation.jl` | Zero-Pressure Accumulation (ZPA) physical line under bottleneck. |
+| `04_nhpp_call_center.jl` | Time-varying Poisson demand via Lewis-Shedler thinning. |
+| `05_makie_visualization.jl` | Makie recipes, live Observable animation, and schedule timelines. |
+
+### Running from the Terminal
+```bash
+julia --project=. examples/01_mm1_analytical_audit.jl
+```
+
+### Running from the Julia REPL
+```julia
+using Pkg; Pkg.activate(".")
+include("examples/01_mm1_analytical_audit.jl")
+include("examples/05_makie_visualization.jl")
+```
+
+---
+
 ## Manual Contents
+
 
 ```@contents
 Pages = [

@@ -72,10 +72,83 @@ save("gantt.png", fig)
 Creates an Observable-backed canvas for interactive trajectory playback:
 
 ```julia
+using SimDES
+using GLMakie  # Opens an interactive window
+
 snapshots = [
-    (t = 0.0, items = [(x = 0.0, y = 0.0)]),
-    (t = 1.0, items = [(x = 2.0, y = 0.0)]),
+    (t = 0.0, items = [(x = 0.0, y = 0.0), (x = 2.0, y = 0.0)]),
+    (t = 1.0, items = [(x = 1.0, y = 0.0), (x = 3.0, y = 0.0)]),
+    (t = 2.0, items = [(x = 2.0, y = 0.0), (x = 4.0, y = 0.0)]),
+    (t = 3.0, items = [(x = 3.0, y = 0.0), (x = 5.0, y = 0.0)]),
 ]
 
-fig, step_obs = animate_sim(snapshots)
+fig, step_obs = animate_sim(snapshots; resolution = (800, 350))
+display(fig)
+
+# Playback trajectory smoothly:
+for i in 1:length(snapshots)
+    step_obs[] = i
+    sleep(0.1) # 100 ms per step
+end
 ```
+
+---
+
+## Live Interactive Streaming with `step_sim!`
+
+In discrete-event simulation, you can stream simulation state directly into an interactive Makie chart during the event loop:
+
+```julia
+using GLMakie
+using SimDES, SimCore, Random
+
+# 1. Setup Observable vectors
+t_obs = Observable(Float64[0.0])
+q_obs = Observable(Int[0])
+
+fig = Figure(size = (850, 400))
+ax  = Axis(fig[1, 1], title = "Live Streaming Buffer Occupancy Q(t)",
+           xlabel = "Simulated Time (s)", ylabel = "Queue Length")
+stairs!(ax, t_obs, q_obs, step = :pre, color = :royalblue, linewidth = 2)
+display(fig)
+
+# 2. Setup simulation world
+world   = SimWorld()
+fel     = FutureEventList()
+cfg     = ZoneConfig(id = 1, arrival_rate = 1.5, num_servers = 1)
+configs = Dict(1 => cfg)
+build_world!(world, cfg)
+rng     = MersenneTwister(42)
+schedule!(fel, EntityArrival(UInt64(1), 1, 0.5), 0.5)
+
+# 3. Stream events interactively:
+for _ in 1:50
+    step = step_sim!(world, fel, configs, rng)
+    step === nothing && break
+
+    push!(t_obs[], step.t)
+    push!(q_obs[], length(world.zones[1].queue))
+    notify(t_obs)
+    notify(q_obs)
+    sleep(0.05) # visual throttle
+end
+```
+
+---
+
+## Running the Complete Visualization Example
+
+A complete runnable script exercising all four recipes is provided in:
+- [`examples/05_makie_visualization.jl`](https://github.com/SouKot/SimDES.jl/blob/main/examples/05_makie_visualization.jl)
+
+### From the Terminal
+```bash
+julia --project=. examples/05_makie_visualization.jl
+```
+
+### From the Julia REPL
+```julia
+using Pkg; Pkg.activate(".")
+include("examples/05_makie_visualization.jl")
+```
+

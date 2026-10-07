@@ -71,8 +71,8 @@ export dispatch!, apply_hook_commands!
 # Warmup detector
 export WelchDetector, update!, warmup_complete
 
-# Main loop
-export sim_loop!
+# Main loop & stepping
+export sim_loop!, step_sim!
 
 # Statistics summary
 export sim_summary

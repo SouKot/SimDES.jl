@@ -103,7 +103,95 @@ println("Mean System Wait W:  ", stats.mean_sojourn) # Expected ≈ 0.50
 
 ---
 
-## 6. Early-Stage Development Advisory (v0.1.0) & Scope
+## 6. Running Examples & Interactive Runtime Inspection
+
+`SimDES.jl` provides 5 runnable example scripts in the [`examples/`](examples/) directory covering analytical benchmarks, accumulation kinematics, and live visualization:
+
+| Script | Mathematical / Physical Focus |
+| :--- | :--- |
+| [`01_mm1_analytical_audit.jl`](examples/01_mm1_analytical_audit.jl) | $M/M/1$ queue benchmarked against closed-form theory ($L, W, W_q, \rho$). |
+| [`02_jackson_open_network.jl`](examples/02_jackson_open_network.jl) | 3-station open Jackson network with feedback routing matrix ($< 1\%$ relative error). |
+| [`03_conveyor_accumulation.jl`](examples/03_conveyor_accumulation.jl) | Zero-Pressure Accumulation (ZPA) physical conveyor with zero collisions under bottleneck. |
+| [`04_nhpp_call_center.jl`](examples/04_nhpp_call_center.jl) | Time-varying arrival demand via Lewis–Shedler rejection thinning. |
+| [`05_makie_visualization.jl`](examples/05_makie_visualization.jl) | 2D flow schematic (`simplot`), queue step-chart, server Gantt timeline, and trajectory animation. |
+
+### Running from the Command Line
+```bash
+# Activate the package environment and run any example
+julia --project=. examples/01_mm1_analytical_audit.jl
+julia --project=. examples/05_makie_visualization.jl
+```
+
+### Running from the Julia REPL
+```julia
+using Pkg
+Pkg.activate(".")
+
+# Execute any example script directly in your active session
+include("examples/01_mm1_analytical_audit.jl")
+include("examples/05_makie_visualization.jl")
+```
+
+### Interactive Runtime Execution & Live Observation
+
+In discrete-event simulation, observing runtime dynamics (queues growing, servers switching states, products accumulating) is essential. `SimDES.jl` supports interactive execution in three complementary ways:
+
+#### A. Event-by-Event Stepping (`step_sim!`)
+Advance the simulation by exactly one event to inspect internal state transitions:
+```julia
+using SimDES, SimCore, Random
+
+world   = SimWorld()
+fel     = FutureEventList()
+cfg     = ZoneConfig(id=1, arrival_rate=1.5, num_servers=1)
+configs = Dict(1 => cfg)
+build_world!(world, cfg)
+rng     = MersenneTwister(42)
+
+# Schedule initial arrival
+schedule!(fel, EntityArrival(UInt64(1), 1, 1.0), 1.0)
+
+# Step one event at a time:
+step_info = step_sim!(world, fel, configs, rng)
+println("Processed $(typeof(step_info.event)) at simulated time t = $(step_info.t)")
+```
+
+#### B. Wall-Clock Throttling & Playback (`SimClock`)
+Control playback speed relative to real time (e.g. 1.0 = real-time, 5.0 = 5× accelerated):
+```julia
+clock = SimClock(1.0)     # 1 simulated second = 1 wall-clock second
+set_speed!(clock, 5.0)    # Accelerate to 5x speed
+set_speed!(clock, Inf)    # Unthrottled maximum CPU throughput
+pause!(clock)             # Freeze simulation advancement
+```
+
+#### C. Live Streaming Visualization with GLMakie & Observables
+Connect the simulation loop to interactive Makie `Observable`s to watch queues and item flow evolve live on screen:
+```julia
+using GLMakie
+using SimDES
+
+# Setup live-updating step chart
+t_obs = Observable(Float64[0.0])
+q_obs = Observable(Int[0])
+
+fig = Figure(size=(850, 400))
+ax  = Axis(fig[1, 1], title="Live Queue Dynamics Q(t)", xlabel="Time (s)", ylabel="Queue Length")
+stairs!(ax, t_obs, q_obs, step=:pre, color=:royalblue, linewidth=2)
+display(fig)
+
+# In your simulation stepping loop:
+# As events fire, update the Observable:
+# push!(t_obs[], world.time)
+# push!(q_obs[], length(world.zones[1].queue))
+# notify(t_obs); notify(q_obs)
+# sleep(0.02)  # smooth visual playback
+```
+
+---
+
+## 7. Early-Stage Development Advisory (v0.1.0) & Scope
+
 
 `SimDES.jl` is released at **`v0.1.0`**.
 * **Maturity**: Core queueing primitives, event dispatching, and conveyor kinematics are mathematically validated against closed-form formulas in the test suite.
@@ -112,12 +200,13 @@ println("Mean System Wait W:  ", stats.mean_sojourn) # Expected ≈ 0.50
 
 ---
 
-## 7. AI Pair-Programming & Human Oversight Disclosure
+## 8. AI Pair-Programming & Human Oversight Disclosure
 
 `SimDES.jl` was authored through human-directed pair programming using Google DeepMind's Antigravity assistant. Every dispatch rule, queueing mechanic, and state machine has been verified by the human maintainers against canonical theoretical formulas from queueing and material flow literature.
 
 ---
 
-## 8. License
+## 9. License
 
 `SimDES.jl` is licensed under the [GNU Affero General Public License v3.0 (AGPLv3)](LICENSE).
+
