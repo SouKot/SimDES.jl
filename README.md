@@ -183,7 +183,7 @@ display(fig)
 # In your simulation stepping loop:
 # As events fire, update the Observable:
 # push!(t_obs[], world.time)
-# push!(q_obs[], length(world.zones[1].queue))
+# push!(q_obs[], world.zone_states[1].queue_length)
 # notify(t_obs); notify(q_obs)
 # sleep(0.02)  # smooth visual playback
 ```

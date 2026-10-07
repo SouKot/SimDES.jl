@@ -127,7 +127,7 @@ for _ in 1:50
     step === nothing && break
 
     push!(t_obs[], step.t)
-    push!(q_obs[], length(world.zones[1].queue))
+    push!(q_obs[], world.zone_states[1].queue_length)
     notify(t_obs)
     notify(q_obs)
     sleep(0.05) # visual throttle
