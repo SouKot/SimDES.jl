@@ -66,13 +66,13 @@ function SimDES.simplot(configs::Vector{ZoneConfig};
 
         # Check routing policy targets
         if zc.routing isa FixedRoute
-            dest = zc.routing.dest_zone
+            dest = zc.routing.to
             if haskey(id_to_idx, dest)
                 push!(target_indices, id_to_idx[dest])
             end
         elseif zc.routing isa ProbRoute
-            for dest in zc.routing.destinations
-                if haskey(id_to_idx, dest)
+            for (dest, _) in zc.routing.choices
+                if dest !== nothing && haskey(id_to_idx, dest)
                     push!(target_indices, id_to_idx[dest])
                 end
             end

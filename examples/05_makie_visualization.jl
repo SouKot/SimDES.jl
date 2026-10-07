@@ -4,21 +4,26 @@
 using SimDES
 using SimCore
 
+# Check if Makie is available in the current environment at top-level
+const MAKIE_AVAILABLE = try
+    @eval using Makie: Makie, save
+    true
+catch
+    false
+end
+
+# Check if GLMakie is also available for rendering
+const GLMAKIE_AVAILABLE = try
+    @eval using GLMakie: GLMakie
+    true
+catch
+    false
+end
+
 println("=== SimDES Example 5: Makie Visualization Recipes ===")
 
 function run_makie_visualization_demo()
-    # Check if Makie / backend is available in the current environment
-    makie_loaded = isdefined(Main, :Makie)
-    if !makie_loaded
-        try
-            @eval using Makie: Makie, save
-            makie_loaded = true
-        catch
-            makie_loaded = false
-        end
-    end
-
-    if !makie_loaded
+    if !MAKIE_AVAILABLE
         println("""
 [INFO] Makie is not loaded in the active environment.
 To enable graphical recipes, load any Makie backend in your Julia session:
@@ -33,6 +38,7 @@ providing `simplot()`, `plot_queue_history()`, `plot_gantt()`, and `animate_sim(
 """)
         return
     end
+
 
     println("Makie detected! Generating visualization figures...")
 
