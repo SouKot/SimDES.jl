@@ -70,7 +70,7 @@ Returns `(event, time)` or `nothing` if the FEL is empty.
 """
 function safe_dequeue!(fel::FutureEventList)
     while !Base.isempty(fel.queue)
-        cev, t = popfirst!(fel.queue)
+        cev, t = dequeue_pair!(fel.queue)
         if cev.id in fel.cancelled
             delete!(fel.cancelled, cev.id)   # consume: free memory, O(1) no lock
             continue          # skip cancelled events
@@ -92,7 +92,7 @@ function peek_time(fel::FutureEventList)
         if cev.id in fel.cancelled
             # A cancelled head must not hide the real next event, or callers step past their horizon.
             delete!(fel.cancelled, cev.id)
-            popfirst!(fel.queue)
+            dequeue!(fel.queue)
             continue
         end
         return t
