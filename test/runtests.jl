@@ -1080,3 +1080,6 @@ end  # @testset "SimDES"
     end
 
 end  # Sprint 2C testset
+
+# ── Optional Extension Tests ──────────────────────────────────────────────────
+include("test_makie_ext.jl")

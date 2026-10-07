@@ -84,4 +84,12 @@ export run_mm1!, run_mmc!, run_mm1k!, run_mg1!, run_md1!
 export run_tandem!, run_jackson!, run_priority!
 export run_with_failures!, run_nhpp!, run_forkjoin!
 
+# ── Visualization extension hooks (implemented in SimDESMakieExt) ─────────────
+function simplot end
+function animate_sim end
+function plot_queue_history end
+function plot_gantt end
+
+export simplot, animate_sim, plot_queue_history, plot_gantt
+
 end

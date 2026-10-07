@@ -11,7 +11,7 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SimCore = "0c356fe6-1c88-4cf8-b16c-a521627c3420"
 
 [weakdeps]
-Makie = "ee78f7c6-11fb-53f2-987a-57730daf7ffb"
+Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
 
 [extensions]
 SimDESMakieExt = "Makie"
@@ -20,7 +20,7 @@ SimDESMakieExt = "Makie"
 Aqua = "0.8"
 DataStructures = "0.18, 0.19"
 Distributions = "0.25"
-Makie = "0.20, 0.21, 0.22"
+Makie = "0.21, 0.22, 0.23, 0.24"
 SimCore = "0.1"
 julia = "1.10"
 
