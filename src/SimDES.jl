@@ -22,7 +22,7 @@ module SimDES
 using SimCore
 import SimCore: cancel!   # explicit import so fel.jl extends SimCore.cancel!
                           # (not a new SimDES-local binding, which would cause ambiguity)
-using DataStructures: PriorityQueue, enqueue!, dequeue_pair!, peek, isempty
+using DataStructures: PriorityQueue, isempty
 using Distributions: Exponential, Erlang, Dirac, UnivariateDistribution, mean
 using Random: AbstractRNG, MersenneTwister, default_rng
 

@@ -58,7 +58,7 @@ at priority `t` (simulated time), and return the event ID (for future cancellati
 """
 function schedule!(fel::FutureEventList, event::SimEvent, t::Float64)
     cev = CancellableEvent(event, t)
-    enqueue!(fel.queue, cev => t)
+    push!(fel.queue, cev => t)
     return cev.id
 end
 
@@ -70,7 +70,7 @@ Returns `(event, time)` or `nothing` if the FEL is empty.
 """
 function safe_dequeue!(fel::FutureEventList)
     while !Base.isempty(fel.queue)
-        cev, t = dequeue_pair!(fel.queue)
+        cev, t = popfirst!(fel.queue)
         if cev.id in fel.cancelled
             delete!(fel.cancelled, cev.id)   # consume: free memory, O(1) no lock
             continue          # skip cancelled events
@@ -88,11 +88,11 @@ Returns `Inf` if the FEL is empty.
 """
 function peek_time(fel::FutureEventList)
     while !Base.isempty(fel.queue)
-        cev, t = peek(fel.queue)
+        cev, t = first(fel.queue)
         if cev.id in fel.cancelled
             # A cancelled head must not hide the real next event, or callers step past their horizon.
             delete!(fel.cancelled, cev.id)
-            dequeue_pair!(fel.queue)
+            popfirst!(fel.queue)
             continue
         end
         return t
