@@ -50,20 +50,21 @@ function run_interactive_conveyor()
     nominal_speed = 1.5    # meters/second
     item_size     = 0.6    # meters (box width & height)
     safety_gap    = 0.15   # meters minimum inter-item spacing
-    gate_x        = 8.8    # meters (obstruction point)
+    gate_x        = 7.0    # meters (intermediate obstruction point at 70% of belt)
 
     # State Observables
-    is_accumulating = Observable(true)   # true = Accumulating ZPA, false = Rigid bed
-    is_blocked      = Observable(false)  # Obstruction gate status
-    is_playing      = Observable(true)   # Play/Pause
-    spawn_interval  = Observable(1.2)    # seconds between incoming arrivals
-    items_count_str = Observable("0")
-    status_str      = Observable("Flowing")
-    mode_desc_str   = Observable("MODE: Accumulating Conveyor (ZPA) — Trailing items queue independently")
+    is_accumulating      = Observable(true)   # true = Accumulating ZPA, false = Rigid bed
+    is_blocked_requested = Observable(false)  # User toggle command
+    gate_state           = Observable(:open)  # :open, :clearing (interlock), :blocked
+    is_playing           = Observable(true)   # Play/Pause
+    spawn_interval       = Observable(1.2)    # seconds between incoming arrivals
+    items_count_str      = Observable("0")
+    status_str           = Observable("Flowing")
+    mode_desc_str        = Observable("MODE: Accumulating Conveyor (ZPA) — Downstream items flow free; upstream items queue independently")
 
     # Animation Frame Observables
     belt_offset_obs = Observable(0.0)    # Texture scroll offset
-    gate_color_obs  = Observable(RGBf(0.12, 0.65, 0.32)) # Green open, Red blocked
+    gate_color_obs  = Observable(RGBf(0.12, 0.65, 0.32)) # Green open, Amber interlock, Red blocked
     gate_y_obs      = Observable(1.5)    # Gate barrier arm elevation
 
     # Item Polygon & Label Observables
@@ -78,7 +79,7 @@ function run_interactive_conveyor()
 
     # ── Makie GUI Layout ───────────────────────────────────────────────────────
 
-    fig = Figure(size = (1000, 580))
+    fig = Figure(size = (1050, 600))
 
     # Header Title
     Label(fig[1, 1], "SimDES Conveyor Kinematics Simulation",
@@ -110,7 +111,7 @@ function run_interactive_conveyor()
     hud_grid = fig[5, 1] = GridLayout()
     Label(hud_grid[1, 1], lift(c -> "Items on Belt: $c", items_count_str),
           font = :bold, fontsize = 13, halign = :center)
-    Label(hud_grid[1, 2], lift(s -> "Belt Status: $s", status_str),
+    Label(hud_grid[1, 2], lift(s -> "Status: $s", status_str),
           font = :bold, fontsize = 13, halign = :center)
 
     # Main Conveyor Viewport
@@ -177,12 +178,28 @@ function run_interactive_conveyor()
     # ── Interactive Callbacks ──────────────────────────────────────────────────
 
     on(btn_block.clicks) do _
-        is_blocked[] = !is_blocked[]
-    end
-
-    on(is_blocked) do blk
-        gate_color_obs[] = blk ? RGBf(0.85, 0.22, 0.22) : RGBf(0.12, 0.65, 0.32)
-        gate_y_obs[]     = blk ? 0.05 : 1.5 # Barrier drops to belt level when blocked
+        is_blocked_requested[] = !is_blocked_requested[]
+        if !is_blocked_requested[]
+            # User commanded gate to open: open immediately
+            gate_state[] = :open
+            gate_color_obs[] = RGBf(0.12, 0.65, 0.32) # Green
+            gate_y_obs[]     = 1.5                    # Raised barrier
+        else
+            # User commanded obstruction:
+            # Check optical sensor interlock: is any box currently straddling the gate?
+            # A box straddles if it has entered the gate aperture but hasn't fully cleared:
+            straddling_idx = findfirst(it -> (it.x < gate_x && (it.x + item_size) > (gate_x - 0.05)), items)
+            if straddling_idx !== nothing
+                # Optical interlock prevents crushing the package
+                gate_state[] = :clearing
+                gate_color_obs[] = RGBf(0.95, 0.70, 0.10) # Amber / Yellow
+                gate_y_obs[]     = 1.5                    # Hold gate open until package clears
+            else
+                gate_state[] = :blocked
+                gate_color_obs[] = RGBf(0.85, 0.22, 0.22) # Red
+                gate_y_obs[]     = 0.05                   # Drop barrier to belt
+            end
+        end
         update_hud()
     end
 
@@ -190,7 +207,7 @@ function run_interactive_conveyor()
         is_accumulating[] = active
         lbl_mode.text[] = active ? "Accumulating (ZPA)" : "Non-Accumulating (Rigid)"
         mode_desc_str[] = active ?
-            "MODE: Accumulating Conveyor (ZPA) — Trailing items queue independently" :
+            "MODE: Accumulating Conveyor (ZPA) — Downstream items flow free; upstream items queue independently" :
             "MODE: Non-Accumulating Conveyor (Rigid Bed) — Entire belt halts simultaneously upon obstruction"
         update_hud()
     end
@@ -207,13 +224,21 @@ function run_interactive_conveyor()
         box_colors_obs[] = RGBf[]
         box_labels_obs[] = Tuple{Point2f, String}[]
         spawn_timer = 0.0
+        gate_state[] = :open
+        is_blocked_requested[] = false
+        gate_color_obs[] = RGBf(0.12, 0.65, 0.32)
+        gate_y_obs[]     = 1.5
         update_hud()
     end
 
     function update_hud()
         st = "Flowing"
-        if is_blocked[]
-            st = is_accumulating[] ? "Queued (Accumulating ZPA)" : "Line Halted (Rigid Bed)"
+        if gate_state[] == :clearing
+            idx = findfirst(it -> (it.x < gate_x && (it.x + item_size) > (gate_x - 0.05)), items)
+            strad_id = idx !== nothing ? "#$(items[idx].id)" : ""
+            st = "Interlock Active: Clearing Package $strad_id"
+        elseif gate_state[] == :blocked
+            st = is_accumulating[] ? "Queued at Gate (Accumulating ZPA)" : "Line Halted (Rigid Bed)"
         end
         status_str[] = st
         items_count_str[] = string(length(items))
@@ -226,10 +251,23 @@ function run_interactive_conveyor()
     function sim_step!()
         !is_playing[] && return
 
+        # 0. Optical Interlock Evaluation
+        # If the user requested gate closure and we are waiting for a straddling package to clear:
+        if is_blocked_requested[] && gate_state[] == :clearing
+            has_straddling = any(it -> (it.x < gate_x && (it.x + item_size) > (gate_x - 0.05)), items)
+            if !has_straddling
+                # Package has fully passed through the gate aperture! Drop gate now.
+                gate_state[] = :blocked
+                gate_color_obs[] = RGBf(0.85, 0.22, 0.22) # Red
+                gate_y_obs[]     = 0.05                   # Drop barrier
+                update_hud()
+            end
+        end
+
         # 1. Belt Speed Determination
         # In non-accumulating (rigid) mode, obstruction stops the entire belt drive
         belt_speed = nominal_speed
-        if !is_accumulating[] && is_blocked[]
+        if !is_accumulating[] && gate_state[] == :blocked
             belt_speed = 0.0
         end
 
@@ -250,38 +288,45 @@ function run_interactive_conveyor()
             end
         end
 
-        # Sort items descending by position (lead item first)
+        # Sort items descending by position (frontmost / downstream item first)
         sort!(items, by = it -> it.x, rev = true)
 
         # 3. Motion & Accumulation Kinematics
+        gate_stop_x = gate_x - item_size # Stopping coordinate for boxes upstream of the gate
+
         for i in 1:length(items)
             it = items[i]
 
             if !is_accumulating[]
                 # Rigid bed: items move strictly with the belt surface
-                if is_blocked[]
-                    it.is_stopped = true
-                else
-                    it.is_stopped = false
+                # When line is halted (belt_speed == 0), items freeze in place.
+                # Zero teleportation: all coordinates and relative gaps are strictly preserved.
+                if belt_speed > 0.0
                     it.x += belt_speed * dt
+                    it.is_stopped = false
+                else
+                    it.is_stopped = true
                 end
             else
                 # Accumulating mode (Zero-Pressure Accumulation / ZPA)
-                target_x = belt_length + 2.0
-
-                if i == 1
-                    # Lead item checks gate obstruction
-                    if is_blocked[]
-                        target_x = gate_x - item_size
-                    end
+                # 3a. Forward bound imposed by the preceding item (if any)
+                target_x = if i == 1
+                    belt_length + 2.0  # Lead item can proceed to discharge
                 else
-                    # Trailing item checks position of item ahead
-                    ahead = items[i - 1]
-                    target_x = ahead.x - item_size - safety_gap
+                    items[i - 1].x - item_size - safety_gap
                 end
 
+                # 3b. Intermediate Gate Obstruction Constraint:
+                # The closed gate ONLY restricts items that are UPSTREAM of the stop line!
+                # If an item has already passed gate_stop_x, the gate is behind it:
+                # it continues downstream towards discharge without interruption.
+                if gate_state[] == :blocked && it.x <= (gate_stop_x + 1e-4)
+                    target_x = min(target_x, gate_stop_x)
+                end
+
+                # 3c. Advance item smoothly towards target_x (zero teleportation)
                 if it.x < target_x
-                    new_x = it.x + belt_speed * dt
+                    new_x = it.x + nominal_speed * dt
                     if new_x >= target_x
                         it.x = target_x
                         it.is_stopped = true
@@ -290,7 +335,7 @@ function run_interactive_conveyor()
                         it.is_stopped = false
                     end
                 else
-                    it.x = target_x
+                    # Already at or ahead of target_x
                     it.is_stopped = true
                 end
             end
