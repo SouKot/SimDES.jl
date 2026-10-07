@@ -21,6 +21,7 @@ Aqua = "0.8"
 DataStructures = "0.18, 0.19"
 Distributions = "0.25"
 Makie = "0.21, 0.22, 0.23, 0.24"
+Random = "1.10"
 SimCore = "0.1"
 julia = "1.10"
 
