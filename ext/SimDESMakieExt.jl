@@ -5,6 +5,19 @@ using Makie
 
 import SimDES: simplot, animate_sim, plot_queue_history, plot_gantt
 
+# Helper to draw 2D directed arrows across Makie version boundaries without deprecation warnings
+function _render_arrow2d!(ax, sx, sy, dx, dy; color = :gray50, linewidth = 2.0, tipsize = 14.0)
+    if isdefined(Makie, :arrows2d!)
+        Makie.arrows2d!(ax, sx, sy, dx, dy;
+                        color = color, shaftwidth = linewidth,
+                        tipwidth = tipsize, tiplength = tipsize)
+    else
+        Makie.arrows!(ax, sx, sy, dx, dy;
+                      color = color, linewidth = linewidth,
+                      arrowsize = tipsize)
+    end
+end
+
 """
     simplot(configs::Vector{ZoneConfig}; layout=:horizontal, resolution=(900, 450), title="Network Schematic") -> Figure
 
@@ -91,9 +104,8 @@ function SimDES.simplot(configs::Vector{ZoneConfig};
                 ux, uy = dx / dist, dy / dist
                 sx, sy = x1 + ux * 0.8, y1 + uy * 0.4
                 ex, ey = x2 - ux * 0.8, y2 - uy * 0.4
-                arrows!(ax, [sx], [sy], [ex - sx], [ey - sy],
-                        color = :gray50, linewidth = 2.0,
-                        arrowsize = 14)
+                _render_arrow2d!(ax, [sx], [sy], [ex - sx], [ey - sy];
+                                 color = :gray50, linewidth = 2.0, tipsize = 14.0)
             end
         end
     end

@@ -159,7 +159,15 @@ function run_interactive_conveyor()
     scatter!(ax, [Point2f(gate_x + 0.09, 2.1)], color = gate_color_obs, markersize = 18, strokewidth = 1.5)
 
     # Flow Velocity Vector Arrow
-    arrows!(ax, [0.5], [-0.25], [1.2], [0.0], color = RGBf(0.18, 0.45, 0.85), linewidth = 2.5)
+    if isdefined(Makie, :arrows2d!)
+        arrows2d!(ax, [0.5], [-0.25], [1.2], [0.0],
+                  color = RGBf(0.18, 0.45, 0.85), shaftwidth = 2.5,
+                  tipwidth = 10.0, tiplength = 10.0)
+    else
+        arrows!(ax, [0.5], [-0.25], [1.2], [0.0],
+                color = RGBf(0.18, 0.45, 0.85), linewidth = 2.5,
+                arrowsize = 10.0)
+    end
     text!(ax, "Belt Flow (1.5 m/s)", position = Point2f(1.8, -0.25), align = (:left, :center), fontsize = 11, color = :gray30)
 
     # 3. Dynamic Boxes (Items on Conveyor)
