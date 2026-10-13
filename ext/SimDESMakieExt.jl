@@ -18,8 +18,38 @@ function _render_arrow2d!(ax, sx, sy, dx, dy; color = :gray50, linewidth = 2.0, 
     end
 end
 
+const _PALETTES = Dict{Symbol, NamedTuple}(
+    :hermes_dark => (
+        bg = RGBf(0.09, 0.09, 0.11),
+        text = :white,
+        border = RGBf(0.22, 0.25, 0.30),
+        source = RGBf(0.20, 0.65, 0.35),
+        server = RGBf(0.25, 0.45, 0.85),
+        conveyor = RGBf(0.95, 0.55, 0.15),
+        sink = RGBf(0.60, 0.30, 0.70)
+    ),
+    :hermes_light => (
+        bg = RGBf(0.95, 0.96, 0.98),
+        text = RGBf(0.12, 0.12, 0.15),
+        border = RGBf(0.80, 0.82, 0.86),
+        source = RGBf(0.15, 0.60, 0.30),
+        server = RGBf(0.20, 0.40, 0.80),
+        conveyor = RGBf(0.90, 0.50, 0.10),
+        sink = RGBf(0.55, 0.25, 0.65)
+    ),
+    :nord => (
+        bg = RGBf(0.18, 0.20, 0.25),
+        text = RGBf(0.93, 0.94, 0.96),
+        border = RGBf(0.30, 0.34, 0.42),
+        source = RGBf(0.64, 0.75, 0.55),
+        server = RGBf(0.51, 0.63, 0.76),
+        conveyor = RGBf(0.82, 0.53, 0.44),
+        sink = RGBf(0.71, 0.56, 0.68)
+    )
+)
+
 """
-    simplot(configs::Vector{ZoneConfig}; layout=:horizontal, resolution=(900, 450), title="Network Schematic") -> Figure
+    simplot(configs::Vector{ZoneConfig}; layout=:horizontal, resolution=(900, 450), title="Network Schematic", theme=:hermes_dark) -> Figure
 
 Render a 2D network schematic of discrete-event simulation zones.
 Nodes are color-coded by role (source, server, conveyor, exit) with directed flow connections.
@@ -27,11 +57,15 @@ Nodes are color-coded by role (source, server, conveyor, exit) with directed flo
 function SimDES.simplot(configs::Vector{ZoneConfig};
                         layout::Symbol = :horizontal,
                         resolution::Tuple{Int, Int} = (900, 450),
-                        title::String = "Discrete-Event Network Schematic")
-    fig = Figure(size = resolution)
+                        title::String = "Discrete-Event Network Schematic",
+                        theme::Symbol = :hermes_dark)
+    pal = get(_PALETTES, theme, _PALETTES[:hermes_dark])
+    fig = Figure(size = resolution, backgroundcolor = pal.bg)
     ax  = Axis(fig[1, 1], title = title,
                xlabel = "System X (m)", ylabel = "System Y (m)",
-               aspect = DataAspect())
+               aspect = DataAspect(),
+               titlecolor = pal.text, xlabelcolor = pal.text, ylabelcolor = pal.text,
+               backgroundcolor = pal.bg)
     hidedecorations!(ax, grid = false)
 
     n = length(configs)
@@ -117,29 +151,29 @@ function SimDES.simplot(configs::Vector{ZoneConfig};
         zc = configs[i]
         cx, cy = xs[i], ys[i]
 
-        # Determine color by zone type
+        # Determine color by zone type from theme palette
         node_color = if !(zc.arrival isa NoArrival)
-            RGBf(0.20, 0.65, 0.35) # Green: Arrival Source
+            pal.source # Arrival Source
         elseif zc.is_conveyor || zc.conveyor_mode != :free_flow
-            RGBf(0.95, 0.55, 0.15) # Orange: Conveyor
+            pal.conveyor # Conveyor
         elseif zc.routing isa ExitSystem
-            RGBf(0.60, 0.30, 0.70) # Purple: Sink / Exit
+            pal.sink # Sink / Exit
         else
-            RGBf(0.25, 0.45, 0.85) # Blue: Service Station
+            pal.server # Service Station
         end
 
         # Node rectangle
         poly!(ax, Rect2f(cx - box_w/2, cy - box_h/2, box_w, box_h),
-              color = node_color, strokecolor = :black, strokewidth = 1.5)
+              color = node_color, strokecolor = pal.border, strokewidth = 1.5)
 
         # Node labels
         label_text = "Zone $(zc.id)"
         cap_text   = zc.capacity < 99999 ? "Cap: $(zc.capacity)" : "Inf Cap"
         text!(ax, cx, cy + 0.12, text = label_text,
-              align = (:center, :center), color = :white,
+              align = (:center, :center), color = pal.text,
               font = :bold, fontsize = 12)
         text!(ax, cx, cy - 0.18, text = cap_text,
-              align = (:center, :center), color = :white,
+              align = (:center, :center), color = pal.text,
               fontsize = 10)
     end
 
