@@ -79,8 +79,13 @@ function dispatch! end
     (record_uptime!(p, dt); nothing)
 
 @inline _mark_departure_optional!(::Nothing, ::UInt64) = nothing
-@inline _mark_departure_optional!(sync_bufs::HybridSyncBuffers, entity_id::UInt64) =
-    (mark_departure!(sync_bufs, Int(entity_id)); nothing)
+@inline function _mark_departure_optional!(sync_bufs::HybridSyncBuffers, entity_id::UInt64)
+    id = Int(entity_id)
+    if id >= 1 && id <= length(sync_bufs.d_agent_in_service) && sync_bufs.d_agent_in_service[id]
+        mark_departure!(sync_bufs, id)
+    end
+    return nothing
+end
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NullEvent — Chandy-Misra null message; no-op in Tier 1
