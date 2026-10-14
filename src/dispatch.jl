@@ -273,6 +273,11 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     else
         lossless ? _outlet_wait(world, configs, e.station_id, cfg, t) : 0.0
     end
+    held_override = Bool(SimCore.get_zone_attribute(world, e.station_id, "_infeed_held", false))
+    if held_override
+        _hold_outlet!(world, fel, configs, e.entity_id, e.station_id, cfg, cmode, 0.5, t)
+        return
+    end
     if outlet_wait > 0.0
         _hold_outlet!(world, fel, configs, e.entity_id, e.station_id, cfg, cmode, outlet_wait, t)
         return
@@ -452,6 +457,167 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
 
     transit = max(dest_cfg.lookahead, 0.0)
     schedule!(fel, EntityArrival(e.entity_id, e.dest_zone, t + transit), t + transit)
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LoadingStart & LoadingComplete — Formal discrete loading (Milestone 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    dispatch!(world, fel, configs, rng, e::LoadingStart, t)
+
+Handle start of cargo loading onto a carrier at a station or transfer berth.
+Tracks active loading, locks station server capacity, and schedules LoadingComplete.
+"""
+function dispatch!(world::SimWorld, fel::FutureEventList,
+                   configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
+                   e::LoadingStart, t::Float64;
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
+    zone = get(world.zone_states, e.station_id, nothing)
+    zone !== nothing && _update_time_averages!(world, zone, e.station_id, t; pipeline=pipeline)
+
+    world.active_loading[e.carrier_id] = (e.item_id, e.station_id, t)
+    if zone !== nothing
+        zone.busy_servers += 1
+        qidx = findfirst(==(e.item_id), zone.queue)
+        if qidx !== nothing
+            deleteat!(zone.queue, qidx)
+            zone.queue_length = length(zone.queue)
+        end
+        ag = get_des_agent(world, e.item_id)
+        if ag === nothing
+            add_des_agent!(world, e.item_id, DESAgent(t, e.station_id, 0, t))
+            _record_arrival_optional!(pipeline)
+        else
+            world.des_agents[e.item_id] = DESAgent(ag.arrival_time, e.station_id, ag.priority, t)
+        end
+    end
+
+    dur = if e.duration >= 0.0
+        e.duration
+    elseif haskey(world.zone_service_override, (e.station_id, e.item_id))
+        world.zone_service_override[(e.station_id, e.item_id)]
+    elseif haskey(configs, e.station_id)
+        _compute_service_duration!(world, rng, e.station_id, e.item_id, configs[e.station_id])
+    else
+        0.0
+    end
+
+    schedule!(fel, LoadingComplete(e.carrier_id, e.item_id, e.station_id, t + dur), t + dur)
+end
+
+"""
+    dispatch!(world, fel, configs, rng, e::LoadingComplete, t)
+
+Handle completion of cargo loading onto a carrier at a station or transfer berth.
+Transfers item to carrier, records sojourn & departure stats on station (Little's Law L = λW),
+and frees station server capacity.
+"""
+function dispatch!(world::SimWorld, fel::FutureEventList,
+                   configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
+                   e::LoadingComplete, t::Float64;
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
+    zone = get(world.zone_states, e.station_id, nothing)
+    zone !== nothing && _update_time_averages!(world, zone, e.station_id, t; pipeline=pipeline)
+
+    # 1. Update Carrier / Cargo ownership tables
+    delete!(world.active_loading, e.carrier_id)
+    world.cargo_carrier[e.item_id] = e.carrier_id
+    cargo_list = get!(world.carrier_cargo, e.carrier_id) do
+        UInt64[]
+    end
+    e.item_id in cargo_list || push!(cargo_list, e.item_id)
+
+    # 2. Record station departure & sojourn stats for Little's Law
+    agent = get_des_agent(world, e.item_id)
+    if agent !== nothing
+        wait_time = (agent.service_start_time == Inf) ? 0.0 : max(0.0, agent.service_start_time - agent.arrival_time)
+        zone_sojourn = max(0.0, t - agent.arrival_time)
+        record_departure!(world.stats, wait_time, zone_sojourn)
+        _record_departure_optional!(pipeline, wait_time, zone_sojourn)
+        _record_zone_departure!(world, e.station_id, wait_time, zone_sojourn)
+        remove_des_agent!(world, e.item_id)
+    end
+
+    # Remove item kinematics if present
+    haskey(world.entity_kinematics, e.item_id) && delete!(world.entity_kinematics, e.item_id)
+
+    # 3. Free server / berth capacity
+    if zone !== nothing
+        zone.busy_servers = max(0, zone.busy_servers - 1)
+        if zone.queue_length > 0 && haskey(configs, e.station_id)
+            cfg = configs[e.station_id]
+            zone.queue_length -= 1
+            next_id = _dequeue_next_entity!(world, zone, cfg)
+            next_agent = get_des_agent(world, next_id)
+            if next_agent !== nothing
+                world.des_agents[next_id] = DESAgent(next_agent.arrival_time,
+                                                      next_agent.current_zone,
+                                                      next_agent.priority, t)
+                st = _compute_service_duration!(world, rng, e.station_id, next_id, cfg)
+                schedule!(fel, ProcessComplete(next_id, e.station_id, t + st), t + st)
+            end
+        end
+    end
+
+    # 4. Release upstream if needed
+    if haskey(configs, e.station_id)
+        cfg = configs[e.station_id]
+        (!isempty(world.entity_kinematics) || !isempty(world.zone_attributes)) && _release_upstream!(world, fel, configs, e.station_id, t)
+    end
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UnloadingStart & UnloadingComplete — Formal discrete unloading (Milestone 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    dispatch!(world, fel, configs, rng, e::UnloadingStart, t)
+
+Handle start of cargo unloading from a carrier into a station or destination zone.
+"""
+function dispatch!(world::SimWorld, fel::FutureEventList,
+                   configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
+                   e::UnloadingStart, t::Float64;
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
+    zone = get(world.zone_states, e.station_id, nothing)
+    zone !== nothing && _update_time_averages!(world, zone, e.station_id, t; pipeline=pipeline)
+
+    world.active_loading[e.carrier_id] = (e.item_id, e.station_id, t)
+
+    dur = if e.duration >= 0.0
+        e.duration
+    elseif haskey(configs, e.station_id)
+        _compute_service_duration!(world, rng, e.station_id, e.item_id, configs[e.station_id])
+    else
+        0.0
+    end
+
+    schedule!(fel, UnloadingComplete(e.carrier_id, e.item_id, e.station_id, t + dur), t + dur)
+end
+
+"""
+    dispatch!(world, fel, configs, rng, e::UnloadingComplete, t)
+
+Handle completion of cargo unloading from a carrier into a station or destination zone.
+Detaches item from carrier and arrives item into destination zone.
+"""
+function dispatch!(world::SimWorld, fel::FutureEventList,
+                   configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
+                   e::UnloadingComplete, t::Float64;
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
+    delete!(world.active_loading, e.carrier_id)
+    delete!(world.cargo_carrier, e.item_id)
+    if haskey(world.carrier_cargo, e.carrier_id)
+        filter!(!=(e.item_id), world.carrier_cargo[e.carrier_id])
+    end
+
+    # Arrive entity into destination zone
+    schedule!(fel, EntityArrival(e.item_id, e.station_id, t, 0, false), t)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1706,6 +1872,35 @@ function apply_hook_commands!(
                         _record_system_exit!(world, uid, ag !== nothing ? ag.arrival_time : t, t)
                     end
                 end
+            end
+
+        elseif op == SimCore.OP_LOAD_ITEM
+            cid = UInt64(max(0, cmd.target_id))
+            iid = UInt64(max(0, cmd.int_arg))
+            zid = Int(cmd.float_arg2)
+            dur = max(0.0, cmd.float_arg)
+            schedule!(fel, SimCore.LoadingStart(cid, iid, zid, t, dur), t)
+
+        elseif op == SimCore.OP_UNLOAD_ITEM
+            cid = UInt64(max(0, cmd.target_id))
+            iid = UInt64(max(0, cmd.int_arg))
+            zid = Int(cmd.float_arg2)
+            dur = max(0.0, cmd.float_arg)
+            schedule!(fel, SimCore.UnloadingStart(cid, iid, zid, t, dur), t)
+
+        elseif op == SimCore.OP_DIVERT_ITEM
+            iid = UInt64(max(0, cmd.target_id))
+            dest_z = Int(cmd.int_arg)
+            world.entity_route_overrides[iid] = dest_z
+
+        elseif op == SimCore.OP_PAUSE_CONVEYOR
+            zid = Int(cmd.target_id)
+            pause_zone!(world, zid, t)
+
+        elseif op == SimCore.OP_RESUME_CONVEYOR
+            zid = Int(cmd.target_id)
+            if zid > 0 && haskey(configs, zid)
+                resume_zone!(world, fel, configs, zid, t)
             end
         end
     end
