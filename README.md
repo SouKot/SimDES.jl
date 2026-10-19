@@ -3,7 +3,7 @@
 [![CI](https://github.com/SouKot/SimDES.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/SouKot/SimDES.jl/actions/workflows/CI.yml?query=branch%3Amain)
 [![Documentation](https://img.shields.io/badge/docs-stable-blue.svg)](https://SouKot.github.io/SimDES.jl/stable/)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Version](https://img.shields.io/badge/version-0.1.0-green.svg)](https://github.com/SouKot/SimDES.jl/releases)
+[![Version](https://img.shields.io/badge/version-0.2.0-green.svg)](https://github.com/SouKot/SimDES.jl/releases)
 
 **A discrete-event simulation engine in Julia for queueing networks, material handling, and manufacturing systems, rigorously verified against closed-form analytical queueing theory.**
 
