@@ -723,6 +723,7 @@ end
             bufs    = HybridSyncBuffers(8)
 
             entity_id = new_entity_id!(world)
+            bufs.d_agent_in_service[entity_id] = true
             schedule!(fel, EntityArrival(entity_id, 1, 0.0), 0.0)
 
             sim_loop!(world, fel, configs, clock, rng; t_end=5.0, pipeline=pipe, sync_bufs=bufs)

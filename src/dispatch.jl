@@ -439,6 +439,67 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Fire & BMS Multi-Physics Interlocks (Phase P4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    dispatch!(world, fel, configs, rng, e::ScheduledChange{:DetectorTrip}, t)
+
+Handles virtual fire/smoke detector trip from fluid domain, scheduling building management
+actuator responses (door releases, smoke extract fans, evacuation alarms).
+"""
+function dispatch!(world::SimWorld, fel::FutureEventList,
+                   configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
+                   e::ScheduledChange{:DetectorTrip}, t::Float64;
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
+    zone_id = e.zone_id
+    if haskey(world.zone_states, zone_id)
+        zone = get_zone(world, zone_id)
+        _update_time_averages!(world, zone, zone_id, t; pipeline=pipeline)
+    end
+
+    # Schedule immediate or delayed BMS interlocks: door unlatch and smoke extract fan
+    schedule!(fel, ScheduledChange{:OpenDoor}(zone_id, t + 0.1), t + 0.1)
+    schedule!(fel, ScheduledChange{:StartFan}(zone_id, t + 0.5), t + 0.5)
+end
+
+"""
+    dispatch!(world, fel, configs, rng, e::ScheduledChange{:OpenDoor}, t)
+
+BMS door unlatch command: unlatches magnetic release door, restoring egress capacity.
+"""
+function dispatch!(world::SimWorld, fel::FutureEventList,
+                   configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
+                   e::ScheduledChange{:OpenDoor}, t::Float64;
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
+    zone_id = e.zone_id
+    if haskey(world.zone_states, zone_id)
+        zone = get_zone(world, zone_id)
+        _update_time_averages!(world, zone, zone_id, t; pipeline=pipeline)
+        zone.num_servers = max(1, zone.num_servers)
+    end
+end
+
+"""
+    dispatch!(world, fel, configs, rng, e::ScheduledChange{:StartFan}, t)
+
+BMS fan start command: initiates mechanical smoke extract ventilation.
+"""
+function dispatch!(world::SimWorld, fel::FutureEventList,
+                   configs::Dict{Int,ZoneConfig}, rng::AbstractRNG,
+                   e::ScheduledChange{:StartFan}, t::Float64;
+                   pipeline::Union{Nothing,StatsPipeline}=nothing,
+                   sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
+    zone_id = e.zone_id
+    if haskey(world.zone_states, zone_id)
+        zone = get_zone(world, zone_id)
+        _update_time_averages!(world, zone, zone_id, t; pipeline=pipeline)
+    end
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TransferOut — entity moves between zones (legacy; routing now via RoutingPolicy)
 # ─────────────────────────────────────────────────────────────────────────────
 

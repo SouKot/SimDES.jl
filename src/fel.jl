@@ -58,7 +58,10 @@ at priority `t` (simulated time), and return the event ID (for future cancellati
 """
 function schedule!(fel::FutureEventList, event::SimEvent, t::Float64)
     cev = CancellableEvent(event, t)
-    push!(fel.queue, cev => t)
+    # Quantize priority key to 1 ps (1e-12 s) to eliminate 1-ULP Float64 representation noise
+    # (e.g. 0.1 + 0.1 + 0.1 vs 0.3) so simultaneous events tie deterministically in FIFO order.
+    t_key = round(t; digits=12)
+    push!(fel.queue, cev => t_key)
     return cev.id
 end
 
