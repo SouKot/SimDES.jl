@@ -1082,5 +1082,11 @@ end  # @testset "SimDES"
 
 end  # Sprint 2C testset
 
+# ── Phase 1 PDES Foundation Tests (FlatBinaryMinHeap, EventKey, Per-Zone RNG) ──
+include("test_flat_fel_and_eventkey.jl")
+
+# ── Phase 2 Conservative PDES Core Tests (SubModel, Promise, SyncEvent, Engine) ──
+include("test_pdes_engine.jl")
+
 # ── Optional Extension Tests ──────────────────────────────────────────────────
 include("test_makie_ext.jl")

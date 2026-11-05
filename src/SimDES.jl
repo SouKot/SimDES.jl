@@ -22,9 +22,10 @@ module SimDES
 using SimCore
 import SimCore: cancel!   # explicit import so fel.jl extends SimCore.cancel!
                           # (not a new SimDES-local binding, which would cause ambiguity)
-using DataStructures: PriorityQueue, isempty, dequeue_pair!, dequeue!
+import DataStructures: enqueue!, dequeue!, dequeue_pair!, isempty
+using DataStructures: PriorityQueue
 using Distributions: Exponential, Erlang, Dirac, UnivariateDistribution, mean
-using Random: AbstractRNG, MersenneTwister, default_rng
+using Random: AbstractRNG, MersenneTwister, Xoshiro, default_rng
 
 # ── Source files ──────────────────────────────────────────────────────────────
 include("fel.jl")
@@ -33,13 +34,18 @@ include("dispatch.jl")
 include("warmup.jl")
 include("loop.jl")
 include("runners.jl")
+include("pdes/dependency_graph.jl")
+include("pdes/sync_event.jl")
+include("pdes/engine.jl")
 
 # ── Exports ───────────────────────────────────────────────────────────────────
 
 # FEL
 # cancel!(fel, id::UInt64) — FEL-local, no lock; extended onto SimCore.cancel! via
 # 'import SimCore: cancel!' above. Same function object → no dual-export ambiguity.
-export FutureEventList, schedule!, safe_dequeue!, peek_time, cancel!
+export FutureEventList, FlatBinaryMinHeap, HeapNode,
+       schedule!, schedule_key!, safe_dequeue!, safe_dequeue_node!,
+       peek_time, peek_key, cancel!
 
 # Zone configuration
 export ZoneConfig, ServiceDist, build_world!
@@ -83,6 +89,15 @@ export run_mm1!, run_mmc!, run_mm1k!, run_mg1!, run_md1!
 # Convenience runners — Phase 2C
 export run_tandem!, run_jackson!, run_priority!
 export run_with_failures!, run_nhpp!, run_forkjoin!
+
+# Phase 2 Conservative PDES Core
+export SubModelDependency, SubModelDependencyGraph
+export add_submodel_dependency!, set_promise_ps!, update_outgoing_promises!, propagate_promises!
+export safe_horizon_ps, min_positive_promise_ps
+export CrossSubModelSyncEvent, on_sender_side!, on_target_side!
+export LockFreeMPSCQueue, push_sync_event!, drain_sync_events!
+export AbstractDESEngine, SerialDESEngine, SubModelPartition, ConservativePDESEngine
+export set_wire_delay!, get_wire_delay, step_des_engine_until!, sync_submodel_worlds_to_master!, consolidate_to_serial_fel!
 
 # ── Visualization extension hooks (implemented in SimDESMakieExt) ─────────────
 function simplot end

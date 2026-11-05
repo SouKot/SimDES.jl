@@ -390,7 +390,8 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
 
     # Schedule repair using BernoulliFailure repair rate β
     if cfg.failures isa BernoulliFailure
-        repair_time = rand(rng, Exponential(1.0 / cfg.failures.β))
+        zrng = get_zone_rng(world, e.resource_id, rng)
+        repair_time = rand(zrng, Exponential(1.0 / cfg.failures.β))
         schedule!(fel, ScheduledChange{:Repair}(e.resource_id, t + repair_time),
                   t + repair_time)
     end
@@ -409,6 +410,7 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
                    sync_bufs::Union{Nothing,HybridSyncBuffers}=nothing)
     zone = get_zone(world, e.zone_id)
     cfg  = configs[e.zone_id]
+    zrng = get_zone_rng(world, e.zone_id, rng)
 
     _update_time_averages!(world, zone, e.zone_id, t; pipeline=pipeline)
 
@@ -424,7 +426,7 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
             world.des_agents[next_id] = DESAgent(next_agent.arrival_time,
                                                   next_agent.current_zone,
                                                   next_agent.priority, t)
-            service_time = cfg.service_dist(rng)
+            service_time = cfg.service_dist(zrng)
             schedule!(fel, ProcessComplete(next_id, e.zone_id, t + service_time),
                       t + service_time)
         end
@@ -432,7 +434,7 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
 
     # Reschedule next failure using BernoulliFailure failure rate α
     if cfg.failures isa BernoulliFailure
-        ttf = rand(rng, Exponential(1.0 / cfg.failures.α))
+        ttf = rand(zrng, Exponential(1.0 / cfg.failures.α))
         schedule!(fel, ResourceFailure(e.zone_id, 1.0f0, t + ttf), t + ttf)
     end
     (!isempty(world.entity_kinematics) || !isempty(world.zone_attributes)) && _release_upstream!(world, fel, configs, e.zone_id, t)
@@ -786,7 +788,7 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
             return :exit
         else
             _record_routed_wait!(world, wait_time)
-            _schedule_routed_arrival!(world, fel, entity_id, dest_override, agent.priority, t)
+            _schedule_routed_arrival!(world, fel, entity_id, dest_override, agent.priority, t, cfg.id)
             return :routed
         end
     end
@@ -799,18 +801,18 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
         dest = routing.to
         _record_routed_wait!(world, wait_time)
         # Keep entity in world; update current_zone for DESAgent
-        _schedule_routed_arrival!(world, fel, entity_id, dest, agent.priority, t)
+        _schedule_routed_arrival!(world, fel, entity_id, dest, agent.priority, t, cfg.id)
         # Routed arrival: is_external=false — does NOT trigger next external arrival at dest
         return :routed
 
     elseif routing isa ProbRoute
-        dest = sample_destination(routing, rng)
+        dest = sample_destination(routing, get_zone_rng(world, cfg.id, rng))
         if dest === nothing
             _record_system_exit!(world, entity_id, agent.arrival_time, t, wait_time)
             return :exit
         else
             _record_routed_wait!(world, wait_time)
-            _schedule_routed_arrival!(world, fel, entity_id, dest, agent.priority, t)
+            _schedule_routed_arrival!(world, fel, entity_id, dest, agent.priority, t, cfg.id)
             # Routed arrival: is_external=false — does NOT trigger next external arrival at dest
             return :routed
         end
@@ -835,7 +837,7 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
             end
         end
         _record_routed_wait!(world, wait_time)
-        _schedule_routed_arrival!(world, fel, entity_id, best_dest, agent.priority, t)
+        _schedule_routed_arrival!(world, fel, entity_id, best_dest, agent.priority, t, cfg.id)
         return :routed
 
     elseif routing isa RoundRobinRoute
@@ -848,7 +850,7 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
         routing.cursor = idx
         dest = cands[idx]
         _record_routed_wait!(world, wait_time)
-        _schedule_routed_arrival!(world, fel, entity_id, dest, agent.priority, t)
+        _schedule_routed_arrival!(world, fel, entity_id, dest, agent.priority, t, cfg.id)
         return :routed
 
     elseif routing isa DynamicPolicyRoute
@@ -863,22 +865,29 @@ function _route_entity!(world::SimWorld, fel::FutureEventList,
             return :exit
         end
         _record_routed_wait!(world, wait_time)
-        _schedule_routed_arrival!(world, fel, entity_id, dest, agent.priority, t)
+        _schedule_routed_arrival!(world, fel, entity_id, dest, agent.priority, t, cfg.id)
         return :routed
     end
     return :unknown
 end
 
 function _schedule_routed_arrival!(world::SimWorld, fel::FutureEventList,
-                                   entity_id::UInt64, dest::Int, priority::Int, t::Float64)
-    pending = SimCore.get_zone_attribute(world, dest, "_pending_arrivals", nothing)
-    if pending === nothing
-        pending = Set{UInt64}()
-        SimCore.set_zone_attribute!(world, dest, "_pending_arrivals", pending)
+                                   entity_id::UInt64, dest::Int, priority::Int, t::Float64,
+                                   from_zone::Int = 0)
+    wire_delay = (from_zone > 0 && !isempty(world.zone_attributes)) ?
+                 max(0.0, Float64(SimCore.get_zone_attribute(world, from_zone, "_wire_delay_to_$(dest)", 0.0))) :
+                 0.0
+    t_arr = wire_delay > 0.0 ? from_picoseconds(to_picoseconds(t) + to_picoseconds(wire_delay)) : t
+    if wire_delay == 0.0
+        pending = SimCore.get_zone_attribute(world, dest, "_pending_arrivals", nothing)
+        if pending === nothing
+            pending = Set{UInt64}()
+            SimCore.set_zone_attribute!(world, dest, "_pending_arrivals", pending)
+        end
+        push!(pending, entity_id)
     end
-    push!(pending, entity_id)
-    world.des_agents[entity_id] = DESAgent(t, dest, priority, Inf)
-    schedule!(fel, EntityArrival(entity_id, dest, t, priority, false), t)
+    world.des_agents[entity_id] = DESAgent(t_arr, dest, priority, Inf)
+    schedule!(fel, EntityArrival(entity_id, dest, t_arr, priority, false), t_arr)
     return nothing
 end
 
@@ -903,17 +912,19 @@ _schedule_next_arrival!(::SimWorld, ::FutureEventList, ::AbstractRNG,
 function _schedule_next_arrival!(world::SimWorld, fel::FutureEventList,
                                   rng::AbstractRNG, zone_id::Int,
                                   a::PoissonArrival, t::Float64)
-    Δt = rand(rng, Exponential(1.0 / a.rate))
-    schedule!(fel, EntityArrival(new_entity_id!(world), zone_id, t + Δt), t + Δt)
+    zrng = get_zone_rng(world, zone_id, rng)
+    Δt = rand(zrng, Exponential(1.0 / a.rate))
+    schedule!(fel, EntityArrival(new_entity_id!(world, zone_id), zone_id, t + Δt), t + Δt)
     return nothing
 end
 
 function _schedule_next_arrival!(world::SimWorld, fel::FutureEventList,
                                   rng::AbstractRNG, zone_id::Int,
                                   a::NHPPArrival, t::Float64)
-    t_next = next_nhpp_arrival(a.schedule, t, rng)
+    zrng = get_zone_rng(world, zone_id, rng)
+    t_next = next_nhpp_arrival(a.schedule, t, zrng)
     if isfinite(t_next)
-        schedule!(fel, EntityArrival(new_entity_id!(world), zone_id, t_next), t_next)
+        schedule!(fel, EntityArrival(new_entity_id!(world, zone_id), zone_id, t_next), t_next)
     end
     return nothing
 end
@@ -1067,7 +1078,7 @@ function _handle_fork!(world::SimWorld, fel::FutureEventList,
     world.join_barriers[e.entity_id] = (n_tasks, 0, t)
 
     for sub_zone_id in fj_cfg.sub_zones
-        sub_id = new_entity_id!(world)
+        sub_id = new_entity_id!(world, e.zone_id)
         world.sub_entity_map[sub_id] = e.entity_id   # sub → parent mapping
         # Sub-entity arrivals: is_external=false — must NOT trigger next arrival at sub-zone
         schedule!(fel, EntityArrival(sub_id, sub_zone_id, t, e.priority, false), t)
@@ -1127,7 +1138,7 @@ _mean_service_time(cfg::ZoneConfig) = mean(cfg.service_dist.dist)
     base_st = if !isempty(world.zone_service_override) && haskey(world.zone_service_override, (zone_id, entity_id))
         pop!(world.zone_service_override, (zone_id, entity_id))
     else
-        cfg.service_dist(rng)
+        cfg.service_dist(get_zone_rng(world, zone_id, rng))
     end
     extra_setup = if !isempty(world.zone_setup_time) && haskey(world.zone_setup_time, (zone_id, entity_id))
         pop!(world.zone_setup_time, (zone_id, entity_id))
@@ -1284,7 +1295,7 @@ function _open_routing(world::SimWorld, configs::Dict{Int, ZoneConfig}, rng::Abs
             push!(opts, (nothing, resid)); total += resid
         end
         isempty(opts) && return r
-        u = rand(rng) * total
+        u = rand(get_zone_rng(world, cfg.id, rng)) * total
         cum = 0.0
         for (d, p) in opts
             cum += p
@@ -1667,13 +1678,14 @@ function dispatch!(world::SimWorld, fel::FutureEventList,
     end
 
     if e.callback !== nothing
+        zrng = get_zone_rng(world, e.zone_id, rng)
         ctx = SimCore.HookContext(world, 0, e.zone_id, e.element_id, t;
-                                  rng=rng, fel=fel, configs=configs,
+                                  rng=zrng, fel=fel, configs=configs,
                                   event_tag=e.tag, event_payload=e.payload)
         SimCore.with_hook_context(ctx) do _
             Base.invokelatest(e.callback)
         end
-        apply_hook_commands!(world, fel, configs, rng, ctx)
+        apply_hook_commands!(world, fel, configs, zrng, ctx)
     end
 
     # Reschedule if recurring (schedule_every!)
